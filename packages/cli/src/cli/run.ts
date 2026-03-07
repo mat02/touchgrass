@@ -9,11 +9,17 @@ import { stripAnsiReadable } from "../utils/ansi";
 import { paths, ensureDirs } from "../config/paths";
 import { getChannelName, getChannelType } from "../channel/id";
 import { watch, readdirSync, statSync, readFileSync, type FSWatcher } from "fs";
-import { chmod, open, writeFile, unlink } from "fs/promises";
+import { open } from "fs/promises";
 import { homedir, platform } from "os";
 import { join } from "path";
 import { createHash } from "crypto";
 import { parseRemoteControlAction } from "../session/remote-control";
+import {
+  readSessionManifestSync,
+  removeSessionManifest,
+  type SessionManifest,
+  writeSessionManifest,
+} from "../session/manifest";
 
 // Per-CLI patterns for detecting approval prompts in terminal output.
 // Both `promptText` and `optionText` must be present in the PTY buffer to trigger a notification.
@@ -230,27 +236,12 @@ export function terminalPicker(title: string, options: string[], hint?: string, 
   });
 }
 
-interface SessionManifest {
-  id: string;
-  command: string;
-  cwd: string;
-  name?: string;
-  pid: number;
-  jsonlFile: string | null;
-  startedAt: string;
-}
-
 async function writeManifest(manifest: SessionManifest): Promise<void> {
-  await ensureDirs();
-  const file = join(paths.sessionsDir, `${manifest.id}.json`);
-  await writeFile(file, JSON.stringify(manifest, null, 2), { encoding: "utf-8", mode: 0o600 });
-  await chmod(file, 0o600).catch(() => {});
+  await writeSessionManifest(manifest, { preserveExistingName: true });
 }
 
 async function removeManifest(id: string): Promise<void> {
-  try {
-    await unlink(join(paths.sessionsDir, `${id}.json`));
-  } catch {}
+  await removeSessionManifest(id);
 }
 
 const SUPPORTED_COMMANDS: Record<string, string[]> = {
@@ -2282,6 +2273,9 @@ export async function runRun(): Promise<void> {
         })
       : null;
     if (remoteId && chatId && ownerUserId && recovery) {
+      const getRecoveryName = (): string | undefined => {
+        return readSessionManifestSync(remoteId)?.name ?? manifest?.name;
+      };
 
       pollTimer = setInterval(async () => {
         if (processingInput || recovery.isRecovering()) return;
@@ -2296,6 +2290,7 @@ export async function runRun(): Promise<void> {
               chatId,
               ownerUserId,
               cwd: process.cwd(),
+              name: getRecoveryName(),
               subscribedGroups: Array.from(subscribedGroups),
               boundChat,
             });
@@ -2413,6 +2408,7 @@ export async function runRun(): Promise<void> {
             chatId,
             ownerUserId,
             cwd: process.cwd(),
+            name: getRecoveryName(),
             subscribedGroups: Array.from(subscribedGroups),
             boundChat,
           });
@@ -2464,6 +2460,7 @@ export async function runRun(): Promise<void> {
                 chatId,
                 ownerUserId,
                 cwd: process.cwd(),
+                name: getRecoveryName(),
                 subscribedGroups: Array.from(subscribedGroups),
                 boundChat,
               });
@@ -2497,6 +2494,7 @@ export async function runRun(): Promise<void> {
               chatId,
               ownerUserId,
               cwd: process.cwd(),
+              name: getRecoveryName(),
               subscribedGroups: Array.from(subscribedGroups),
               boundChat,
             });

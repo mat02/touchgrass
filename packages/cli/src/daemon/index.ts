@@ -5,7 +5,6 @@ import {
   getAllPairedUsers,
   getChatMuted,
   getChatOutputMode,
-  getChatThinkingEnabled,
   getTelegramBotToken,
   isLinkedGroup,
   removeLinkedGroup,
@@ -156,9 +155,6 @@ export async function startDaemon(): Promise<void> {
   const getOutputModeForChat = (chatId: ChannelChatId) => getChatOutputMode(config, chatId);
   const isChatMutedForChat = (chatId: ChannelChatId): boolean => {
     return getChatMuted(config, chatId);
-  };
-  const isThinkingEnabledForChat = (chatId: ChannelChatId): boolean => {
-    return getChatThinkingEnabled(config, chatId);
   };
   const sendToChat = (chatId: ChannelChatId, content: string): void => {
     const channel = getChannelForChat(chatId);
@@ -2267,15 +2263,11 @@ export async function startDaemon(): Promise<void> {
       const truncated = text.length > 1000 ? text.slice(0, 1000) + "..." : text;
       for (const cid of targets) {
         if (isChatMutedForChat(cid)) continue;
-        if (!isThinkingEnabledForChat(cid)) continue;
         const outputMode = getOutputModeForChat(cid);
+        if (outputMode !== "thinking") continue;
         const fmt = getFormatterForChat(cid);
-        if (outputMode === "verbose") {
-          sendToChat(cid, `${fmt.bold("Thinking")}\n${fmt.italic(fmt.fromMarkdown(truncated))}`);
-        } else {
-          const compact = truncated.length > 220 ? `${truncated.slice(0, 220)}...` : truncated;
-          sendToChat(cid, `${fmt.escape("💭")} ${fmt.italic(fmt.fromMarkdown(compact))}`);
-        }
+        const compact = truncated.length > 220 ? `${truncated.slice(0, 220)}...` : truncated;
+        sendToChat(cid, `${fmt.escape("💭")} ${fmt.italic(fmt.fromMarkdown(compact))}`);
       }
     },
     handleAssistantText(sessionId: string, text: string): void {

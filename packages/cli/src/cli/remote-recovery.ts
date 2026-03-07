@@ -16,6 +16,7 @@ export interface RemoteRecoveryInput {
   chatId: ChannelChatId;
   ownerUserId: string;
   cwd: string;
+  name?: string;
   subscribedGroups: string[];
   boundChat: ChannelChatId | null;
 }
@@ -86,6 +87,7 @@ export function createRemoteRecoveryController(
           cwd: input.cwd,
           sessionId: input.remoteId,
           subscribedGroups: input.subscribedGroups,
+          ...(input.name ? { name: input.name } : {}),
         });
         if (regRes.ok && input.boundChat) {
           await deps.daemonRequest("/remote/bind-chat", "POST", {

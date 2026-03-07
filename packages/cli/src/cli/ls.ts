@@ -58,7 +58,8 @@ export async function runLs(): Promise<void> {
   } else {
     // Fallback: show manifests if daemon is unreachable
     for (const m of manifests.values()) {
-      console.log(`  ${m.id}  ${"unknown".padEnd(8)}  ${m.command}  ${m.cwd}`);
+      const nameLabel = m.name ? `  "${m.name}"` : "";
+      console.log(`  ${m.id}  ${"unknown".padEnd(8)}${nameLabel}  ${m.command}  ${m.cwd}`);
     }
   }
 }

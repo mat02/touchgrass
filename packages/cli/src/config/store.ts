@@ -74,13 +74,16 @@ export async function loadConfig(): Promise<TgConfig> {
           delete parsed.chatPreferences[chatId];
           continue;
         }
-        const mode = (pref as { outputMode?: unknown }).outputMode;
-        const thinking = (pref as { thinking?: unknown }).thinking;
+        const rawPref = pref as { outputMode?: unknown; thinking?: unknown; muted?: unknown };
+        if (rawPref.thinking === true) {
+          rawPref.outputMode = "thinking";
+        }
+        delete rawPref.thinking;
+        const mode = rawPref.outputMode;
         const muted = (pref as { muted?: unknown }).muted;
-        const validMode = mode === undefined || mode === "verbose" || mode === "compact";
-        const validThinking = thinking === undefined || typeof thinking === "boolean";
+        const validMode = mode === undefined || mode === "verbose" || mode === "compact" || mode === "thinking";
         const validMuted = muted === undefined || typeof muted === "boolean";
-        if (!validMode || !validThinking || !validMuted) {
+        if (!validMode || !validMuted) {
           delete parsed.chatPreferences[chatId];
           continue;
         }
@@ -91,7 +94,6 @@ export async function loadConfig(): Promise<TgConfig> {
         // Keep only meaningful preference objects.
         if (
           (pref as { outputMode?: unknown }).outputMode === undefined &&
-          (pref as { thinking?: unknown }).thinking !== true &&
           (pref as { muted?: unknown }).muted !== true
         ) {
           delete parsed.chatPreferences[chatId];

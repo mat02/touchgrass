@@ -12,10 +12,8 @@ ${fmt.bold("Commands:")}
 /change_session ${fmt.escape("—")} Switch to a different session
 /stop_remote_control ${fmt.escape("—")} Disconnect session from this chat
 /session ${fmt.escape("—")} Show current session info
-/files ${fmt.escape("—")} Pick repo paths for next message
-/output_mode ${fmt.escape("—")} Set output style (simple/verbose)
-/thinking ${fmt.escape("—")} Toggle thinking previews
-/background_jobs ${fmt.escape("—")} List running background jobs
+/name ${fmt.escape("—")} Set or clear the current session name
+/output_mode ${fmt.escape("—")} Set output style (simple/thinking/verbose)
 /link ${fmt.escape("—")} Add this chat as a channel
 /pair ${fmt.escape("—")} Pair with a pairing code`;
 }

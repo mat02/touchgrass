@@ -6,6 +6,7 @@ import {
   __filePickerTestUtils,
   handleInlineFileSearch,
 } from "../bot/handlers/files";
+import { routeMessage } from "../bot/command-router";
 import { SessionManager } from "../session/manager";
 import { createDefaultConfig, defaultSettings } from "../config/schema";
 
@@ -189,5 +190,40 @@ describe("inline file search shorthand", () => {
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
+  });
+});
+
+describe("removed files command", () => {
+  it("reports that /files was removed and points to inline search", async () => {
+    const sent: string[] = [];
+    const config = createDefaultConfig();
+    config.channels.telegram = {
+      type: "telegram",
+      credentials: {},
+      pairedUsers: [{ userId: "telegram:1", pairedAt: new Date().toISOString() }],
+      linkedGroups: [],
+    };
+    const sessionManager = new SessionManager(defaultSettings);
+    const ctx = {
+      config,
+      sessionManager,
+      channel: {
+        fmt: {
+          code: (v: string) => v,
+          escape: (v: string) => v,
+        },
+        send: async (_chatId: string, text: string) => {
+          sent.push(text);
+        },
+      },
+    } as any;
+
+    await routeMessage(
+      { userId: "telegram:1", chatId: "telegram:100", text: "/files readme" },
+      ctx
+    );
+
+    expect(sent[0]).toContain("command was removed");
+    expect(sent[0]).toContain("@?<query>");
   });
 });

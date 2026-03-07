@@ -9,14 +9,11 @@ import { handlePair } from "./handlers/pair";
 import { handleHelp } from "./handlers/help";
 import { handleSessionMgmt } from "./handlers/session-mgmt";
 import { handleStdinInput } from "./handlers/stdin-input";
-import { handleFilesCommand, handleInlineFileSearch } from "./handlers/files";
+import { handleInlineFileSearch } from "./handlers/files";
 import { handleSessionCommand } from "./handlers/session";
+import { handleNameCommand } from "./handlers/name";
 import { handleOutputModeCommand } from "./handlers/output-mode";
-import { handleThinkingCommand } from "./handlers/thinking";
-import {
-  handleBackgroundJobsCommand,
-  type BackgroundJobSessionSummary,
-} from "./handlers/background-jobs";
+import type { BackgroundJobSessionSummary } from "./handlers/background-jobs";
 import { handleSkillsCommand } from "./handlers/skills";
 import { handleStartRemoteControl, handleStopRemoteControl } from "./handlers/remote-control";
 import { logger } from "../daemon/logger";
@@ -73,14 +70,11 @@ export async function routeMessage(
   const cmdPrefix = text.startsWith("touchgrass ") ? "touchgrass" : text.startsWith("tg ") ? "tg" : null;
   if (cmdPrefix) {
     const rest = text.slice(cmdPrefix.length);
-    if (rest === " files" || rest.startsWith(" files ")) text = `/files${rest.slice(" files".length)}`;
-    else if (rest === " session") text = "/session";
+    if (rest === " session") text = "/session";
+    else if (rest === " name" || rest.startsWith(" name ")) text = `/name${rest.slice(" name".length)}`;
     else if (rest === " change_session" || rest === " change-session") text = "/change_session";
     else if (rest === " output_mode" || rest.startsWith(" output_mode ")) text = `/output_mode${rest.slice(" output_mode".length)}`;
     else if (rest === " output-mode" || rest.startsWith(" output-mode ")) text = `/output_mode${rest.slice(" output-mode".length)}`;
-    else if (rest === " thinking" || rest.startsWith(" thinking ")) text = `/thinking${rest.slice(" thinking".length)}`;
-    else if (rest === " background_jobs" || rest.startsWith(" background_jobs ")) text = "/background_jobs";
-    else if (rest === " background-jobs" || rest.startsWith(" background-jobs ")) text = "/background-jobs";
     else if (rest === " skills") text = "/skills";
     else if (rest === " link" || rest.startsWith(" link ")) text = `/link${rest.slice(" link".length)}`;
     else if (rest === " unlink") text = "/unlink";
@@ -186,6 +180,12 @@ export async function routeMessage(
     text !== "/start-remote-control" &&
     text !== "/change_session" &&
     text !== "/change-session" &&
+    text !== "/files" &&
+    !text.startsWith("/files ") &&
+    text !== "/thinking" &&
+    !text.startsWith("/thinking ") &&
+    text !== "/background-jobs" &&
+    text !== "/background_jobs" &&
     !linked
   ) {
     await ctx.channel.send(chatId, `This group is not linked yet. Run ${fmt.code("/link")} or ${fmt.code("/start_remote_control")} first.`);
@@ -205,10 +205,24 @@ export async function routeMessage(
     }
   }
 
-  // /files [query] — pick a repository file and insert as @path in next message
   if (text === "/files" || text.startsWith("/files ")) {
-    const query = text.slice("/files".length).trim();
-    await handleFilesCommand({ ...msg, text }, query, ctx);
+    await ctx.channel.send(
+      chatId,
+      `The ${fmt.code("/files")} command was removed. Use ${fmt.code("@?<query>")} to search files inline.`
+    );
+    return;
+  }
+
+  if (text === "/thinking" || text.startsWith("/thinking ")) {
+    await ctx.channel.send(
+      chatId,
+      `The ${fmt.code("/thinking")} command was removed. Use ${fmt.code("/output_mode thinking")} instead.`
+    );
+    return;
+  }
+
+  if (text === "/background-jobs" || text === "/background_jobs") {
+    await ctx.channel.send(chatId, `The ${fmt.code("/background_jobs")} command was removed.`);
     return;
   }
 
@@ -238,9 +252,10 @@ export async function routeMessage(
     return;
   }
 
-  // /background-jobs — list currently running background jobs
-  if (text === "/background-jobs" || text === "/background_jobs") {
-    await handleBackgroundJobsCommand({ ...msg, text }, ctx);
+  // /name [value] — set or clear the current session name
+  if (text === "/name" || text.startsWith("/name ")) {
+    const nameArg = text.slice("/name".length).trim() || undefined;
+    await handleNameCommand({ ...msg, text }, nameArg, ctx);
     return;
   }
 
@@ -250,17 +265,10 @@ export async function routeMessage(
     return;
   }
 
-  // /output_mode [simple|verbose] — choose how noisy bridge output should be
+  // /output_mode [simple|thinking|verbose] — choose how noisy bridge output should be
   if (text === "/output_mode" || text === "/output-mode" || text.startsWith("/output_mode ") || text.startsWith("/output-mode ")) {
     const modeArg = text.replace(/^\/output(?:_|-)mode/i, "").trim() || undefined;
     await handleOutputModeCommand({ ...msg, text }, modeArg, ctx);
-    return;
-  }
-
-  // /thinking [on|off|toggle] — control thinking previews for this chat
-  if (text === "/thinking" || text.startsWith("/thinking ")) {
-    const toggleArg = text.replace(/^\/thinking/i, "").trim() || undefined;
-    await handleThinkingCommand({ ...msg, text }, toggleArg, ctx);
     return;
   }
 
@@ -356,15 +364,36 @@ export async function routeMessage(
   if (mgmtPrefix) {
     const args = text.slice(mgmtPrefix.length).trim();
 
+    if (args === "files" || args.startsWith("files ")) {
+      await ctx.channel.send(
+        chatId,
+        `The ${fmt.code("touchgrass files")} command was removed. Use ${fmt.code("@?<query>")} to search files inline.`
+      );
+      return;
+    }
+
+    if (args === "thinking" || args.startsWith("thinking ")) {
+      await ctx.channel.send(
+        chatId,
+        `The ${fmt.code("touchgrass thinking")} command was removed. Use ${fmt.code("touchgrass output_mode thinking")} instead.`
+      );
+      return;
+    }
+
+    if (args === "background_jobs" || args === "background-jobs" || args.startsWith("background_jobs ") || args.startsWith("background-jobs ")) {
+      await ctx.channel.send(chatId, `The ${fmt.code("touchgrass background-jobs")} command was removed.`);
+      return;
+    }
+
     // Session management commands
     if (["ls", "attach", "detach", "stop", "kill", "restart", "session"].some((cmd) => args.startsWith(cmd))) {
       await handleSessionMgmt(msg, args, ctx);
       return;
     }
 
-      await ctx.channel.send(
+    await ctx.channel.send(
       chatId,
-      `Unknown command. Use ${fmt.code("touchgrass files [query]")}, ${fmt.code("touchgrass session")}, ${fmt.code("touchgrass resume")}, ${fmt.code("touchgrass output_mode simple|verbose")}, ${fmt.code("touchgrass thinking on|off|toggle")}, ${fmt.code("touchgrass background-jobs")}, ${fmt.code("touchgrass attach <id>")}, ${fmt.code("touchgrass detach")}, ${fmt.code("touchgrass stop <id>")}, ${fmt.code("touchgrass kill <id>")}, or ${fmt.code("touchgrass restart [session_id]")}. Start sessions from your terminal with ${fmt.code("touchgrass claude")}, ${fmt.code("touchgrass codex")}, ${fmt.code("touchgrass pi")}, or ${fmt.code("touchgrass kimi")}.`
+      `Unknown command. Use ${fmt.code("touchgrass session")}, ${fmt.code("touchgrass name <value>")}, ${fmt.code("touchgrass resume")}, ${fmt.code("touchgrass output_mode simple|thinking|verbose")}, ${fmt.code("touchgrass attach <id>")}, ${fmt.code("touchgrass detach")}, ${fmt.code("touchgrass stop <id>")}, ${fmt.code("touchgrass kill <id>")}, or ${fmt.code("touchgrass restart [session_id]")}. Start sessions from your terminal with ${fmt.code("touchgrass claude")}, ${fmt.code("touchgrass codex")}, ${fmt.code("touchgrass pi")}, or ${fmt.code("touchgrass kimi")}.`
     );
     return;
   }

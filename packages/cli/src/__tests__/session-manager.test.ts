@@ -159,6 +159,34 @@ describe("canUserAccessSession", () => {
   });
 });
 
+describe("setRemoteName", () => {
+  it("updates the stored name for an existing remote session", () => {
+    const mgr = createManager();
+    const remote = mgr.registerRemote("claude", "telegram:100" as ChannelChatId, "telegram:100" as ChannelUserId);
+
+    const updated = mgr.setRemoteName(remote.id, "Auth work");
+
+    expect(updated?.name).toBe("Auth work");
+    expect(mgr.getRemote(remote.id)?.name).toBe("Auth work");
+  });
+
+  it("clears the stored name when undefined is provided", () => {
+    const mgr = createManager();
+    const remote = mgr.registerRemote(
+      "claude",
+      "telegram:100" as ChannelChatId,
+      "telegram:100" as ChannelUserId,
+      "/tmp",
+      undefined,
+      "Auth work"
+    );
+
+    mgr.setRemoteName(remote.id, undefined);
+
+    expect(mgr.getRemote(remote.id)?.name).toBeUndefined();
+  });
+});
+
 describe("drainRemoteInput", () => {
   it("returns and clears queued input", () => {
     const mgr = createManager();
@@ -325,11 +353,11 @@ describe("output mode picker state", () => {
       messageId: "1",
       chatId: "telegram:100" as ChannelChatId,
       ownerUserId: "telegram:100" as ChannelUserId,
-      options: ["compact", "verbose"],
+      options: ["compact", "thinking", "verbose"],
     });
 
     const picker = mgr.getOutputModePickerByPollId("output-1");
-    expect(picker?.options).toEqual(["compact", "verbose"]);
+    expect(picker?.options).toEqual(["compact", "thinking", "verbose"]);
     mgr.removeOutputModePicker("output-1");
     expect(mgr.getOutputModePickerByPollId("output-1")).toBeUndefined();
   });

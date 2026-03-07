@@ -72,18 +72,16 @@ interface TelegramBotCommand {
 }
 
 const TELEGRAM_COMMANDS = {
-  files: { command: "files", description: "Pick repo paths for next message" },
-  session: { command: "session", description: "Show current session and resume command" },
-  changeSession: { command: "change_session", description: "Switch to a different session" },
-  outputMode: { command: "output_mode", description: "Set output mode simple/verbose" },
-  thinking: { command: "thinking", description: "Toggle thinking on/off" },
-  backgroundJobs: { command: "background_jobs", description: "List running background jobs" },
-  skills: { command: "skills", description: "List available agent skills" },
-  startRemoteControl: { command: "start_remote_control", description: "Connect a running session to this chat" },
-  stopRemoteControl: { command: "stop_remote_control", description: "Disconnect session from this chat" },
-  link: { command: "link", description: "Add this chat as a channel" },
-  unlink: { command: "unlink", description: "Remove this chat as a channel" },
-  pair: { command: "pair", description: "Pair with code: /pair <code>" },
+  session: { command: "session", description: "Show current session" },
+  name: { command: "name", description: "Rename current session" },
+  changeSession: { command: "change_session", description: "Switch session" },
+  outputMode: { command: "output_mode", description: "Set output mode" },
+  skills: { command: "skills", description: "List agent skills" },
+  startRemoteControl: { command: "start_remote_control", description: "Connect a session" },
+  stopRemoteControl: { command: "stop_remote_control", description: "Disconnect this chat" },
+  link: { command: "link", description: "Add this chat" },
+  unlink: { command: "unlink", description: "Remove this chat" },
+  pair: { command: "pair", description: "Pair with code" },
 } as const satisfies Record<string, TelegramBotCommand>;
 
 function parseNumericChannelId(id: string): number | null {
@@ -105,10 +103,8 @@ function buildCommandMenu(
       TELEGRAM_COMMANDS.stopRemoteControl,
       TELEGRAM_COMMANDS.changeSession,
       TELEGRAM_COMMANDS.session,
-      TELEGRAM_COMMANDS.files,
+      TELEGRAM_COMMANDS.name,
       TELEGRAM_COMMANDS.outputMode,
-      TELEGRAM_COMMANDS.thinking,
-      TELEGRAM_COMMANDS.backgroundJobs,
       TELEGRAM_COMMANDS.skills
     );
   } else {

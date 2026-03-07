@@ -5,13 +5,14 @@ import { saveConfig } from "../../config/store";
 
 const OUTPUT_MODE_CHOICES: Array<{ mode: OutputMode; label: string }> = [
   { mode: "compact", label: "Simple (default)" },
+  { mode: "thinking", label: "Thinking (simple + thoughts)" },
   { mode: "verbose", label: "Verbose" },
 ];
 
 const VALID_MODES = new Set<OutputMode>(OUTPUT_MODE_CHOICES.map((choice) => choice.mode));
 
 function usageText(): string {
-  return "Usage: /output_mode simple|verbose";
+  return "Usage: /output_mode simple|thinking|verbose";
 }
 
 function normalizeOutputModeArg(value: string): string {
@@ -54,7 +55,7 @@ export async function handleOutputModeCommand(
     }
     await ctx.channel.send(
       msg.chatId,
-      `${fmt.escape("⛳️")} Output mode for this chat is ${fmt.code(fmt.escape(currentLabel))}.\n${fmt.escape("simple = cleaner bridge output, verbose = include tool call/result logs.")}\n${fmt.escape(usageText())}`
+      `${fmt.escape("⛳️")} Output mode for this chat is ${fmt.code(fmt.escape(currentLabel))}.\n${fmt.escape("simple = cleaner bridge output, thinking = simple output plus thinking previews, verbose = include tool call/result logs.")}\n${fmt.escape(usageText())}`
     );
     return;
   }

@@ -55,7 +55,7 @@ describe("output mode command", () => {
 
     expect(sent).toHaveLength(1);
     expect(sent[0]).toContain("simple");
-    expect(sent[0]).toContain("Usage: /output_mode simple|verbose");
+    expect(sent[0]).toContain("Usage: /output_mode simple|thinking|verbose");
   });
 
   it("opens picker buttons when /output_mode has no args and polling is supported", async () => {
@@ -70,7 +70,7 @@ describe("output mode command", () => {
     expect(sent).toHaveLength(0);
     const picker = ctx.sessionManager.getOutputModePickerByPollId("poll-output-mode");
     expect(picker).toBeDefined();
-    expect(picker.options).toEqual(["compact", "verbose"]);
+    expect(picker.options).toEqual(["compact", "thinking", "verbose"]);
   });
 
   it("accepts tg output-mode alias", async () => {
@@ -96,7 +96,7 @@ describe("output mode command", () => {
     );
 
     expect(sent).toHaveLength(1);
-    expect(sent[0]).toContain("Usage: /output_mode simple|verbose");
+    expect(sent[0]).toContain("Usage: /output_mode simple|thinking|verbose");
     expect(sent[0]).toContain("Current mode: simple");
   });
 
@@ -113,6 +113,19 @@ describe("output mode command", () => {
     expect(sent[0]).toContain("Output mode is now simple");
   });
 
+  it("accepts thinking as an explicit mode", async () => {
+    const sent: string[] = [];
+    const ctx = createCtx(sent);
+
+    await routeMessage(
+      { userId: "telegram:1", chatId: "telegram:100", text: "/output_mode thinking" },
+      ctx
+    );
+
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toContain("Output mode is now thinking");
+  });
+
   it("rejects removed messages_only mode", async () => {
     const sent: string[] = [];
     const ctx = createCtx(sent);
@@ -123,7 +136,7 @@ describe("output mode command", () => {
     );
 
     expect(sent).toHaveLength(1);
-    expect(sent[0]).toContain("Usage: /output_mode simple|verbose");
+    expect(sent[0]).toContain("Usage: /output_mode simple|thinking|verbose");
     expect(sent[0]).toContain("Current mode: simple");
   });
 

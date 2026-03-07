@@ -25,11 +25,10 @@ export interface TgConfig {
   chatPreferences?: Record<string, ChatPreferences>;
 }
 
-export type OutputMode = "compact" | "verbose";
+export type OutputMode = "compact" | "thinking" | "verbose";
 
 export interface ChatPreferences {
   outputMode?: OutputMode;
-  thinking?: boolean;
   muted?: boolean;
 }
 
@@ -70,12 +69,11 @@ export function validateConfig(config: unknown): config is TgConfig {
 }
 
 export function getChatOutputMode(config: TgConfig, chatId: string): OutputMode {
-  const mode = config.chatPreferences?.[chatId]?.outputMode;
-  return mode === "verbose" ? "verbose" : "compact";
-}
-
-export function getChatThinkingEnabled(config: TgConfig, chatId: string): boolean {
-  return config.chatPreferences?.[chatId]?.thinking === true;
+  const pref = config.chatPreferences?.[chatId] as (ChatPreferences & { thinking?: unknown }) | undefined;
+  const mode = pref?.outputMode;
+  if (mode === "verbose" || mode === "thinking") return mode;
+  if (pref?.thinking === true) return "thinking";
+  return "compact";
 }
 
 export function getChatMuted(config: TgConfig, chatId: string): boolean {
@@ -85,10 +83,9 @@ export function getChatMuted(config: TgConfig, chatId: string): boolean {
 function pruneChatPreference(config: TgConfig, chatId: string): void {
   const pref = config.chatPreferences?.[chatId];
   if (!pref) return;
-  const hasOutputMode = pref.outputMode === "verbose";
-  const hasThinking = pref.thinking === true;
+  const hasOutputMode = pref.outputMode === "verbose" || pref.outputMode === "thinking";
   const hasMuted = pref.muted === true;
-  if (!hasOutputMode && !hasThinking && !hasMuted) {
+  if (!hasOutputMode && !hasMuted) {
     delete config.chatPreferences?.[chatId];
   }
 }
@@ -96,20 +93,10 @@ function pruneChatPreference(config: TgConfig, chatId: string): void {
 export function setChatOutputMode(config: TgConfig, chatId: string, mode: OutputMode): boolean {
   if (getChatOutputMode(config, chatId) === mode) return false;
   if (!config.chatPreferences) config.chatPreferences = {};
-  const nextPref: ChatPreferences = { ...(config.chatPreferences[chatId] || {}) };
+  const nextPref = { ...(config.chatPreferences[chatId] || {}) } as ChatPreferences & { thinking?: unknown };
   if (mode === "compact") delete nextPref.outputMode;
   else nextPref.outputMode = mode;
-  config.chatPreferences[chatId] = nextPref;
-  pruneChatPreference(config, chatId);
-  return true;
-}
-
-export function setChatThinkingEnabled(config: TgConfig, chatId: string, enabled: boolean): boolean {
-  if (getChatThinkingEnabled(config, chatId) === enabled) return false;
-  if (!config.chatPreferences) config.chatPreferences = {};
-  const nextPref: ChatPreferences = { ...(config.chatPreferences[chatId] || {}) };
-  if (enabled) nextPref.thinking = true;
-  else delete nextPref.thinking;
+  delete nextPref.thinking;
   config.chatPreferences[chatId] = nextPref;
   pruneChatPreference(config, chatId);
   return true;

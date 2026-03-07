@@ -11,6 +11,7 @@ function baseInput(overrides: Partial<RemoteRecoveryInput> = {}): RemoteRecovery
     chatId: "telegram:123",
     ownerUserId: "telegram:123",
     cwd: "/tmp/project",
+    name: "Build bot",
     subscribedGroups: ["telegram:-100:4"],
     boundChat: "telegram:-100:4",
     ...overrides,
@@ -44,6 +45,7 @@ describe("remote daemon recovery", () => {
     expect(calls[0]?.path).toBe("/remote/register");
     expect(calls[0]?.method).toBe("POST");
     expect(calls[0]?.body?.sessionId).toBe("r-abc123");
+    expect(calls[0]?.body?.name).toBe("Build bot");
     expect(calls[0]?.body?.subscribedGroups).toEqual(["telegram:-100:4"]);
     expect(calls[1]?.path).toBe("/remote/bind-chat");
     expect(logs).toContain("Lost daemon registration. Attempting re-register...");

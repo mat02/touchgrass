@@ -1,7 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import { routeMessage } from "../bot/command-router";
 import { SessionManager } from "../session/manager";
-import { defaultSettings, getChatThinkingEnabled } from "../config/schema";
+import { defaultSettings, getChatOutputMode } from "../config/schema";
 
 const fmt = {
   bold: (value: string) => value,
@@ -40,8 +40,8 @@ function createCtx(sent: string[]) {
   } as any;
 }
 
-describe("thinking command", () => {
-  it("toggles thinking on when no args are provided", async () => {
+describe("removed thinking command", () => {
+  it("reports that /thinking was removed", async () => {
     const sent: string[] = [];
     const ctx = createCtx(sent);
 
@@ -50,27 +50,12 @@ describe("thinking command", () => {
       ctx
     );
 
-    expect(getChatThinkingEnabled(ctx.config, "telegram:100")).toBe(true);
-    expect(sent[0]).toContain("Thinking is now on");
+    expect(getChatOutputMode(ctx.config, "telegram:100")).toBe("compact");
+    expect(sent[0]).toContain("command was removed");
+    expect(sent[0]).toContain("/output_mode thinking");
   });
 
-  it("accepts explicit off value", async () => {
-    const sent: string[] = [];
-    const ctx = createCtx(sent);
-    await routeMessage(
-      { userId: "telegram:1", chatId: "telegram:100", text: "/thinking on" },
-      ctx
-    );
-    await routeMessage(
-      { userId: "telegram:1", chatId: "telegram:100", text: "/thinking off" },
-      ctx
-    );
-
-    expect(getChatThinkingEnabled(ctx.config, "telegram:100")).toBe(false);
-    expect(sent[sent.length - 1]).toContain("Thinking is now off");
-  });
-
-  it("supports tg thinking alias", async () => {
+  it("reports that tg thinking alias was removed", async () => {
     const sent: string[] = [];
     const ctx = createCtx(sent);
 
@@ -79,33 +64,8 @@ describe("thinking command", () => {
       ctx
     );
 
-    expect(getChatThinkingEnabled(ctx.config, "telegram:100")).toBe(true);
-    expect(sent[0]).toContain("Thinking is now on");
-  });
-
-  it("shows usage on invalid value", async () => {
-    const sent: string[] = [];
-    const ctx = createCtx(sent);
-
-    await routeMessage(
-      { userId: "telegram:1", chatId: "telegram:100", text: "/thinking maybe" },
-      ctx
-    );
-
-    expect(sent).toHaveLength(1);
-    expect(sent[0]).toContain("Usage: /thinking on|off|toggle");
-  });
-
-  it("confirms state change without mode-specific suffix", async () => {
-    const sent: string[] = [];
-    const ctx = createCtx(sent);
-
-    await routeMessage(
-      { userId: "telegram:1", chatId: "telegram:100", text: "/thinking on" },
-      ctx
-    );
-
-    expect(sent[0]).toContain("Thinking is now on");
-    expect(sent[0]).not.toContain("hidden while output mode");
+    expect(getChatOutputMode(ctx.config, "telegram:100")).toBe("compact");
+    expect(sent[0]).toContain("command was removed");
+    expect(sent[0]).toContain("output_mode thinking");
   });
 });

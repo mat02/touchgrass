@@ -1,7 +1,7 @@
 import { randomBytes } from "crypto";
 import type { ChannelChatId, ChannelUserId } from "../channel/types";
 import type { SessionInfo } from "./types";
-import type { TgSettings } from "../config/schema";
+import type { OutputMode, TgSettings } from "../config/schema";
 import { mergeRemoteControlAction, type RemoteControlAction } from "./remote-control";
 
 export interface RemoteSession {
@@ -90,7 +90,7 @@ export interface PendingOutputModePicker {
   messageId: string;
   chatId: ChannelChatId;
   ownerUserId: ChannelUserId;
-  options: Array<"compact" | "verbose">;
+  options: OutputMode[];
 }
 
 export interface PendingRecentMessagesPoll {
@@ -274,6 +274,13 @@ export class SessionManager {
 
   getRemote(id: string): RemoteSession | undefined {
     return this.remotes.get(id);
+  }
+
+  setRemoteName(id: string, name?: string): RemoteSession | undefined {
+    const remote = this.remotes.get(id);
+    if (!remote) return undefined;
+    remote.name = name;
+    return remote;
   }
 
   drainRemoteInput(id: string): string[] {

@@ -91,7 +91,7 @@ describe("background jobs handler", () => {
     expect(rendered).not.toContain("bg_6 —");
   });
 
-  it("routes tg background-jobs alias through command router", async () => {
+  it("reports that tg background-jobs alias was removed", async () => {
     const sent: string[] = [];
     const config = {
       channels: {
@@ -112,12 +112,6 @@ describe("background jobs handler", () => {
         fmt,
         send: async (_chatId: string, content: string) => sent.push(content),
       },
-      listBackgroundJobs: () => [{
-        sessionId: "r-abc123",
-        command: "claude",
-        cwd: "/tmp/touchgrass",
-        jobs: [{ taskId: "bg_42", updatedAt: Date.now() - 1_000 }],
-      }],
     } as any;
 
     await routeMessage(
@@ -125,11 +119,10 @@ describe("background jobs handler", () => {
       ctx
     );
 
-    expect(sent[0]).toContain("Background jobs (1 running)");
-    expect(sent[0]).toContain("bg_42");
+    expect(sent[0]).toContain("command was removed");
   });
 
-  it("routes /background_jobs command through command router", async () => {
+  it("reports that /background_jobs was removed", async () => {
     const sent: string[] = [];
     const config = {
       channels: {
@@ -150,12 +143,6 @@ describe("background jobs handler", () => {
         fmt,
         send: async (_chatId: string, content: string) => sent.push(content),
       },
-      listBackgroundJobs: () => [{
-        sessionId: "r-def456",
-        command: "claude",
-        cwd: "/tmp/touchgrass",
-        jobs: [{ taskId: "bg_99", updatedAt: Date.now() - 1_000 }],
-      }],
     } as any;
 
     await routeMessage(
@@ -163,7 +150,6 @@ describe("background jobs handler", () => {
       ctx
     );
 
-    expect(sent[0]).toContain("Background jobs (1 running)");
-    expect(sent[0]).toContain("bg_99");
+    expect(sent[0]).toContain("command was removed");
   });
 });
