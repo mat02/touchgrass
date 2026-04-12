@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-REPO="tomtev/touchgrass"
+REPO="mat02/touchgrass"
 INSTALL_DIR="${TG_INSTALL_DIR:-$HOME/.local/bin}"
 BINARY_NAME="touchgrass"
 WINDOWS_OS=false

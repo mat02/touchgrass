@@ -1,6 +1,6 @@
 $ErrorActionPreference = "Stop"
 
-$Repo = "tomtev/touchgrass"
+$Repo = "mat02/touchgrass"
 $DefaultInstallDir = Join-Path $HOME ".touchgrass\bin"
 $InstallDir = if ($env:TG_INSTALL_DIR) { $env:TG_INSTALL_DIR } else { $DefaultInstallDir }
 $BinaryName = "touchgrass.exe"
