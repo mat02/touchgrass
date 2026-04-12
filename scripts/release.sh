@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Build release binaries and create a GitHub release
 # Usage: ./scripts/release.sh [version]
-# Example: ./scripts/release.sh v0.1.0
+# Example: ./scripts/release.sh v0.1.124
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -60,5 +60,5 @@ if [[ $REPLY =~ ^[Yy]$ ]]; then
   echo "Release created: https://github.com/$(gh repo view --json nameWithOwner -q .nameWithOwner)/releases/tag/${VERSION}"
   echo ""
   echo "Users can install with:"
-  echo "  curl -fsSL https://touchgrass.sh/install.sh | bash"
+  echo "  curl -fsSL https://raw.githubusercontent.com/mat02/touchgrass/main/install.sh | bash"
 fi
