@@ -10,6 +10,7 @@ import {
   isLinkedGroup,
   removeLinkedGroup,
   setChatOutputPreferences,
+  type ChatOutputPreferences,
 } from "../config/schema";
 import { TelegramApi } from "../channels/telegram/api";
 import { logger } from "./logger";
@@ -58,6 +59,52 @@ function sessionLabel(command: string, cwd: string, name?: string): string {
   const folder = cwd.split("/").pop();
   return folder ? `${tool} (${folder})` : tool;
 }
+
+function formatThinkingNotification(
+  fmt: Formatter,
+  thinkingMode: ChatOutputPreferences["thinkingMode"],
+  text: string
+ ): string | null {
+  if (thinkingMode === "off") return null;
+  const body = thinkingMode === "preview"
+    ? (text.length > 220 ? `${text.slice(0, 220)}...` : text)
+    : text;
+  return `${fmt.escape("💭")} ${fmt.italic(fmt.fromMarkdown(body))}`;
+}
+
+function formatToolResultNotification(
+  fmt: Formatter,
+  output: Pick<ChatOutputPreferences, "toolResultMode" | "toolErrors">,
+  toolName: string,
+  content: string,
+  isError = false
+ ): string | null {
+  if (isError) {
+    if (!output.toolErrors) return null;
+  } else if (output.toolResultMode === "off") {
+    return null;
+  }
+
+  if (!isError && output.toolResultMode === "full") {
+    const maxLen = 1500;
+    const truncated = content.length > maxLen ? content.slice(0, maxLen) + "\n..." : content;
+    const label = (toolName === "Bash" || toolName === "bash" || toolName === "exec_command") ? "Output" : `${toolName} result`;
+    return `${fmt.bold(fmt.escape(label))}\n${fmt.pre(fmt.escape(truncated))}`;
+  }
+
+  if (isError && output.toolResultMode === "full") {
+    const maxLen = 1500;
+    const truncated = content.length > maxLen ? content.slice(0, maxLen) + "\n..." : content;
+    return `${fmt.bold(fmt.escape(`${toolName || "Tool"} error`))}\n${fmt.pre(fmt.escape(truncated))}`;
+  }
+
+  return formatSimpleToolResult(fmt, toolName, content, isError);
+}
+
+export const __daemonTestUtils = {
+  formatThinkingNotification,
+  formatToolResultNotification,
+};
 
 type BackgroundJobStatus = "running" | "completed" | "failed" | "killed";
 
@@ -2355,12 +2402,10 @@ export async function startDaemon(): Promise<void> {
       for (const cid of targets) {
         if (isChatMutedForChat(cid)) continue;
         const output = getOutputPreferencesForChat(cid);
-        if (output.thinkingMode === "off") continue;
         const fmt = getFormatterForChat(cid);
-        const body = output.thinkingMode === "preview"
-          ? (text.length > 220 ? `${text.slice(0, 220)}...` : text)
-          : text;
-        sendToChat(cid, `${fmt.escape("💭")} ${fmt.italic(fmt.fromMarkdown(body))}`);
+        const message = formatThinkingNotification(fmt, output.thinkingMode, text);
+        if (!message) continue;
+        sendToChat(cid, message);
       }
     },
     handleAssistantText(sessionId: string, text: string): void {
@@ -2399,26 +2444,10 @@ export async function startDaemon(): Promise<void> {
       for (const cid of targets) {
         if (isChatMutedForChat(cid)) continue;
         const output = getOutputPreferencesForChat(cid);
-        if (isError) {
-          if (!output.toolErrors) continue;
-        } else if (output.toolResultMode === "off") {
-          continue;
-        }
         const fmt = getFormatterForChat(cid);
-        if (!isError && output.toolResultMode === "full") {
-          const maxLen = 1500;
-          const truncated = content.length > maxLen ? content.slice(0, maxLen) + "\n..." : content;
-          const label = (toolName === "Bash" || toolName === "bash" || toolName === "exec_command") ? "Output" : `${toolName} result`;
-          sendToChat(cid, `${fmt.bold(fmt.escape(label))}\n${fmt.pre(fmt.escape(truncated))}`);
-        } else if (isError && output.toolResultMode === "full") {
-          const maxLen = 1500;
-          const truncated = content.length > maxLen ? content.slice(0, maxLen) + "\n..." : content;
-          sendToChat(cid, `${fmt.bold(fmt.escape(`${toolName || "Tool"} error`))}\n${fmt.pre(fmt.escape(truncated))}`);
-        } else {
-          const summary = formatSimpleToolResult(fmt, toolName, content, isError);
-          if (!summary) continue;
-          sendToChat(cid, summary);
-        }
+        const message = formatToolResultNotification(fmt, output, toolName, content, isError);
+        if (!message) continue;
+        sendToChat(cid, message);
         if (!isError) setTypingForChat(cid, true);
       }
     },
