@@ -1,4 +1,7 @@
 import { describe, expect, it } from "bun:test";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "fs";
+import { tmpdir } from "os";
+import { join } from "path";
 import { __cliRunTestUtils } from "../cli/run";
 
 describe("background job parser", () => {
@@ -417,6 +420,97 @@ describe("background job parser", () => {
       },
     ]);
   });
+
+  it("extracts OMP ask tool questions as Telegram polls", () => {
+    __cliRunTestUtils.resetParserState();
+
+    const parsed = __cliRunTestUtils.parseJsonlMessage({
+      type: "message",
+      message: {
+        role: "assistant",
+        content: [
+          {
+            type: "toolCall",
+            id: "omp-ask-1",
+            name: "ask",
+            arguments: {
+              questions: [
+                {
+                  question: "Choose a path",
+                  options: [{ label: "A" }, { label: "B" }],
+                  multiSelect: false,
+                },
+              ],
+            },
+          },
+        ],
+      },
+    });
+
+    expect(parsed.questions).toEqual([
+      {
+        question: "Choose a path",
+        options: [{ label: "A" }, { label: "B" }],
+        multiSelect: false,
+      },
+    ]);
+    expect(parsed.toolCalls).toEqual([]);
+  });
+
+  it("surfaces OMP plan mode transitions as assistant text", () => {
+    __cliRunTestUtils.resetParserState();
+
+    const entered = __cliRunTestUtils.parseJsonlMessage({
+      type: "mode_change",
+      mode: "plan",
+      data: { planFilePath: "local://PLAN.md" },
+    });
+    const exited = __cliRunTestUtils.parseJsonlMessage({
+      type: "mode_change",
+      mode: "none",
+    });
+
+    expect(entered.assistantText).toContain("Plan mode active");
+    expect(entered.assistantText).toContain("local://PLAN.md");
+    expect(exited.assistantText).toContain("Plan mode exited");
+  });
+
+  it("expands OMP exit_plan_mode results into plan review text", () => {
+    __cliRunTestUtils.resetParserState();
+
+    const root = mkdtempSync(join(tmpdir(), "tg-omp-plan-review-"));
+    try {
+      const sessionFile = join(root, "session.jsonl");
+      const localDir = join(root, "session", "local");
+      mkdirSync(localDir, { recursive: true });
+      writeFileSync(join(localDir, "REVIEW_PLAN.md"), "# Review Plan\n\nApprove this plan.");
+
+      const parsed = __cliRunTestUtils.parseJsonlMessage(
+        {
+          type: "message",
+          message: {
+            role: "toolResult",
+            toolName: "exit_plan_mode",
+            content: [{ type: "text", text: "Plan ready for approval." }],
+            isError: false,
+            details: {
+              title: "REVIEW_PLAN",
+              finalPlanFilePath: "local://REVIEW_PLAN.md",
+            },
+          },
+        },
+        sessionFile
+      );
+
+      expect(parsed.assistantText).toContain("Plan ready for approval: REVIEW_PLAN");
+      expect(parsed.assistantText).toContain("# Review Plan");
+      expect(parsed.assistantText).toContain("Approve this plan.");
+      expect(parsed.toolResults).toEqual([]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
 
   it("forwards Claude Task tool results for simple-mode summarization", () => {
     __cliRunTestUtils.resetParserState();

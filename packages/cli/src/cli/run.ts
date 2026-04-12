@@ -11,7 +11,7 @@ import { getChannelName, getChannelType } from "../channel/id";
 import { watch, readdirSync, statSync, readFileSync, type FSWatcher } from "fs";
 import { open } from "fs/promises";
 import { homedir, platform } from "os";
-import { join, basename } from "path";
+import { join, basename, dirname } from "path";
 import { createHash } from "crypto";
 import { parseRemoteControlAction } from "../session/remote-control";
 import { listOmpSessionFiles, resolveOmpSessionsRoot } from "../session/omp";
@@ -653,10 +653,56 @@ function extractKimiToolResultText(returnValue: Record<string, unknown> | null):
   return chunks.join("\n").trim();
 }
 
+function extractQuestionSetFromToolCall(name: string, input: Record<string, unknown>): unknown[] | null {
+  const normalized = name.trim().toLowerCase();
+  if (normalized !== "askuserquestion" && normalized !== "ask") return null;
+  return Array.isArray(input.questions) ? (input.questions as unknown[]) : null;
+}
+
+function formatOmpModeChange(mode: string, data: Record<string, unknown> | null): string | null {
+  if (mode === "plan") {
+    const planFile = typeof data?.planFilePath === "string" ? data.planFilePath : "local://PLAN.md";
+    return `⛳ Plan mode active. Read-only until plan approval.\nPlan file: ${planFile}`;
+  }
+  if (mode === "none") {
+    return "⛳ Plan mode exited. Full tool access restored.";
+  }
+  return null;
+}
+
+function readOmpLocalArtifact(sourceFilePath: string, localUri: string): string | null {
+  const match = localUri.match(/^local:\/\/(.+)$/);
+  if (!match) return null;
+  const sessionDir = sourceFilePath.endsWith(".jsonl")
+    ? sourceFilePath.slice(0, -".jsonl".length)
+    : dirname(sourceFilePath);
+  try {
+    const text = readFileSync(join(sessionDir, "local", match[1]!), "utf-8").trim();
+    return text || null;
+  } catch {
+    return null;
+  }
+}
+
+function buildOmpPlanReviewText(details: Record<string, unknown> | null, sourceFilePath?: string): string | null {
+  const title = typeof details?.title === "string" ? details.title.trim() : "";
+  const artifactUri = typeof details?.finalPlanFilePath === "string"
+    ? details.finalPlanFilePath
+    : typeof details?.planFilePath === "string"
+    ? details.planFilePath
+    : "local://PLAN.md";
+  const header = title
+    ? `⛳ Plan ready for approval: ${title}`
+    : "⛳ Plan ready for approval.";
+  if (!sourceFilePath) return `${header}\n\nReview artifact: ${artifactUri}`;
+  const planText = readOmpLocalArtifact(sourceFilePath, artifactUri);
+  if (!planText) return `${header}\n\nReview artifact: ${artifactUri}`;
+  return `${header}\n\n${planText}`;
+}
+
 const kimiAssistantTextBuffer: string[] = [];
 const kimiAssistantThinkingBuffer: string[] = [];
-
-function parseJsonlMessage(msg: Record<string, unknown>): ParsedMessage {
+function parseJsonlMessage(msg: Record<string, unknown>, sourceFilePath?: string): ParsedMessage {
   // Gemini flat JSON format
   if (
     msg.type === "tool_use" ||
@@ -719,13 +765,12 @@ function parseJsonlMessage(msg: Record<string, unknown>): ParsedMessage {
             toolUseIdToName.set(toolId, name);
             toolUseIdToInput.set(toolId, ((block.input as Record<string, unknown>) || {}));
           }
-          if (name === "AskUserQuestion") {
-            const input = block.input as Record<string, unknown> | undefined;
-            if (input?.questions && Array.isArray(input.questions)) {
-              questions = input.questions as unknown[];
-            }
+          const input = (block.input as Record<string, unknown>) || {};
+          const questionsFromTool = extractQuestionSetFromToolCall(name, input);
+          if (questionsFromTool) {
+            questions = questionsFromTool;
           } else {
-            toolCalls.push({ id: toolId, name, input: (block.input as Record<string, unknown>) || {} });
+            toolCalls.push({ id: toolId, name, input });
           }
           break;
         }
@@ -834,7 +879,14 @@ function parseJsonlMessage(msg: Record<string, unknown>): ParsedMessage {
     return EMPTY_PARSED;
   }
 
-  // PI format — role determines assistant vs tool result
+  const modeChange = msg.type === "mode_change" && typeof msg.mode === "string"
+    ? formatOmpModeChange(msg.mode, asRecord(msg.data))
+    : null;
+  if (modeChange) {
+    return { ...EMPTY_PARSED, assistantText: modeChange };
+  }
+
+  // PI / OMP format — role determines assistant vs tool result
   if (msg.type === "message") {
     const m = msg.message as Record<string, unknown> | undefined;
     if (!m?.content || !Array.isArray(m.content)) return EMPTY_PARSED;
@@ -843,6 +895,7 @@ function parseJsonlMessage(msg: Record<string, unknown>): ParsedMessage {
       const content = m.content as Array<Record<string, unknown>>;
       const texts: string[] = [];
       const thinkings: string[] = [];
+      let questions: unknown[] | null = null;
       const toolCalls: ToolCallInfo[] = [];
       for (const block of content) {
         switch (block.type) {
@@ -861,7 +914,12 @@ function parseJsonlMessage(msg: Record<string, unknown>): ParsedMessage {
               toolUseIdToName.set(toolId, name);
               toolUseIdToInput.set(toolId, input);
             }
-            toolCalls.push({ id: toolId, name, input });
+            const questionsFromTool = extractQuestionSetFromToolCall(name, input);
+            if (questionsFromTool) {
+              questions = questionsFromTool;
+            } else {
+              toolCalls.push({ id: toolId, name, input });
+            }
             break;
           }
         }
@@ -869,21 +927,27 @@ function parseJsonlMessage(msg: Record<string, unknown>): ParsedMessage {
       capIdMap();
       const assistantText = texts.join("\n").trim() || null;
       const thinking = thinkings.join("\n").trim() || null;
-      return { assistantText, thinking, questions: null, toolCalls, toolResults: [], backgroundJobEvents: [] };
+      return { assistantText, thinking, questions, toolCalls, toolResults: [], backgroundJobEvents: [] };
     }
 
     if (m.role === "toolResult") {
       const toolName = (m.toolName as string) || toolUseIdToName.get(m.toolCallId as string) || "";
       const isError = m.isError === true;
-      if (!isError && !FORWARD_RESULT_TOOLS.has(toolName)) return EMPTY_PARSED;
-      const content = m.content as Array<{ type: string; text?: string }>;
-      const text = content
+      const content = m.content as Array<{ type: string; text?: string }> | undefined;
+      const text = (content || [])
         .filter((s) => s.type === "text")
         .map((s) => s.text ?? "")
         .join("\n")
         .trim();
       if (isError && isToolRejection(text)) return EMPTY_PARSED;
       if (!text) return EMPTY_PARSED;
+      if (!isError && toolName === "exit_plan_mode") {
+        return {
+          ...EMPTY_PARSED,
+          assistantText: buildOmpPlanReviewText(asRecord(m.details), sourceFilePath) || text,
+        };
+      }
+      if (!isError && !FORWARD_RESULT_TOOLS.has(toolName)) return EMPTY_PARSED;
       return { ...EMPTY_PARSED, toolResults: [{ toolName: toolName || "unknown", content: text, isError }] };
     }
 
@@ -1238,7 +1302,7 @@ function watchSessionFile(
           try {
             const msg = JSON.parse(line);
             if (onMessageParsed) onMessageParsed(msg);
-            const parsed = parseJsonlMessage(msg);
+            const parsed = parseJsonlMessage(msg, filePath);
             if (parsed.assistantText) onAssistant(parsed.assistantText);
             if (onQuestion && parsed.questions) onQuestion(parsed.questions);
             if (onToolCall && parsed.toolCalls.length > 0) onToolCall(parsed.toolCalls);
