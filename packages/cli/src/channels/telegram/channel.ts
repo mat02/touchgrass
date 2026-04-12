@@ -26,6 +26,16 @@ import { chmod, open, readFile, readdir, stat, unlink } from "fs/promises";
 import { createHash } from "crypto";
 import type { FileHandle } from "fs/promises";
 
+function stripHtmlForChunkFallback(html: string): string {
+  return html.replace(/<[^>]+>/g, "");
+}
+
+function chunkHtmlForTelegramFallback(html: string): string[] {
+  const plain = stripHtmlForChunkFallback(html);
+  return chunkText(plain);
+}
+
+
 function toChatId(channelName: string, num: number, threadId?: number): ChannelChatId {
   if (channelName === "telegram") {
     if (threadId && threadId !== 1) return `telegram:${num}:${threadId}`;
@@ -189,6 +199,21 @@ export class TelegramChannel implements Channel {
       this.lastMessage.delete(chatId);
     } catch (e) {
       const err = e as Error;
+      if (/message is too long/i.test(err.message)) {
+        await logger.warn("Retrying long Telegram message as plain-text chunks", { chatId });
+        try {
+          for (const chunk of chunkHtmlForTelegramFallback(html)) {
+            await this.api.sendMessage(numChatId, chunk, "HTML", threadId);
+          }
+          this.lastMessage.delete(chatId);
+          return;
+        } catch (chunkError) {
+          const retryErr = chunkError as Error;
+          await logger.error("Failed to send long message chunks", { chatId, error: retryErr.message });
+          if (this.isDeadChatError(retryErr.message)) this.onDeadChat?.(chatId, retryErr);
+          return;
+        }
+      }
       await logger.error("Failed to send message", { chatId, error: err.message });
       if (this.isDeadChatError(err.message)) this.onDeadChat?.(chatId, err);
     }

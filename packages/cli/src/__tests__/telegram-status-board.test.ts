@@ -122,4 +122,58 @@ describe("TelegramChannel status board", () => {
 
     expect(calls).toEqual(["editMessageText"]);
   });
+  it("retries long messages as chunked plain text", async () => {
+    const sent: string[] = [];
+    const channel = new TelegramChannel("bot-token");
+    const anyChannel = channel as unknown as {
+      api: {
+        sendMessage: (chatId: number, text: string, parseMode: "HTML" | "MarkdownV2" | "", threadId?: number) => Promise<{ message_id: number }>;
+      };
+    };
+
+    let attempts = 0;
+    anyChannel.api = {
+      sendMessage: async (_chatId, text) => {
+        attempts++;
+        if (attempts === 1) {
+          throw new Error("Telegram API sendMessage failed (400): {\"ok\":false,\"description\":\"Bad Request: message is too long\"}");
+        }
+        sent.push(text);
+        return { message_id: attempts };
+      },
+    };
+
+    await channel.send("telegram:123", `<b>${"A".repeat(5000)}</b>`);
+
+    expect(sent.length).toBeGreaterThan(1);
+    expect(sent.join("")).toBe("A".repeat(5000));
+  });
+
+  it("drops html formatting when chunk fallback is used", async () => {
+    const sent: string[] = [];
+    const channel = new TelegramChannel("bot-token");
+    const anyChannel = channel as unknown as {
+      api: {
+        sendMessage: (chatId: number, text: string, parseMode: "HTML" | "MarkdownV2" | "", threadId?: number) => Promise<{ message_id: number }>;
+      };
+    };
+
+    let attempts = 0;
+    anyChannel.api = {
+      sendMessage: async (_chatId, text) => {
+        attempts++;
+        if (attempts === 1) {
+          throw new Error("Telegram API sendMessage failed (400): {\"ok\":false,\"description\":\"Bad Request: message is too long\"}");
+        }
+        sent.push(text);
+        return { message_id: attempts };
+      },
+    };
+
+    await channel.send("telegram:123", `<b>${"A".repeat(4090)}</b><i>${"B".repeat(100)}</i>`);
+
+    expect(sent.join("")).toBe(`${"A".repeat(4090)}${"B".repeat(100)}`);
+    expect(sent.join("")).not.toContain("<b>");
+    expect(sent.join("")).not.toContain("<i>");
+  });
 });
