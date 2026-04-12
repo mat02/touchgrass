@@ -90,6 +90,7 @@ async function main() {
     case "claude":
     case "codex":
     case "pi":
+    case "omp":
     case "kimi":
     case "gemini": {
       const { runRun } = await import("./cli/run");
@@ -108,7 +109,7 @@ async function main() {
       break;
     default: {
       console.error(`Unknown command: ${command}`);
-      console.error("Supported commands: touchgrass setup, touchgrass claude, touchgrass codex, touchgrass pi, touchgrass kimi, touchgrass gemini, touchgrass send, touchgrass stop, touchgrass kill, touchgrass restart");
+      console.error("Supported commands: touchgrass setup, touchgrass claude, touchgrass codex, touchgrass pi, touchgrass omp, touchgrass kimi, touchgrass gemini, touchgrass send, touchgrass stop, touchgrass kill, touchgrass restart");
       console.error(`Run "touchgrass help" for more information.`);
       process.exit(1);
     }
@@ -125,11 +126,12 @@ Commands:
   claude   Run Claude Code with chat bridge
   codex    Run Codex with chat bridge
   pi       Run PI with chat bridge
+  omp      Run Oh My Pi with chat bridge
   kimi     Run Kimi CLI with chat bridge
   gemini   Run Gemini CLI with chat bridge
   resume   Resume a recent session (picker or --last for most recent)
 
-Options (for claude/codex/pi/kimi/gemini/resume):
+Options (for claude/codex/pi/omp/kimi/gemini/resume):
   --channel <value>      Skip channel picker (use "dm", a chatId, or title substring)
   --name <value>         Give the session a human-readable name
   --last                 Skip session picker, resume most recent (resume only)

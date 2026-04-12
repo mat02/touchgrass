@@ -1,9 +1,10 @@
+import { readSessionManifestSync } from "../../session/manifest";
 import type { InboundMessage } from "../../channel/types";
 import type { RemoteSession } from "../../session/manager";
 import type { RouterContext } from "../command-router";
 import { handleSessionCommand } from "./session";
 
-type SessionTool = "claude" | "codex" | "pi" | "kimi" | "gemini";
+type SessionTool = "claude" | "codex" | "pi" | "omp" | "kimi" | "gemini";
 
 function cleanToken(token: string | undefined): string | null {
   if (!token) return null;
@@ -13,13 +14,16 @@ function cleanToken(token: string | undefined): string | null {
 
 function detectTool(command: string): SessionTool | null {
   const head = command.trim().split(/\s+/)[0]?.toLowerCase();
-  if (head === "claude" || head === "codex" || head === "pi" || head === "kimi" || head === "gemini") return head;
+  if (head === "claude" || head === "codex" || head === "pi" || head === "omp" || head === "kimi" || head === "gemini") return head;
   return null;
 }
 
 function extractResumeRef(tool: SessionTool, command: string): string | null {
   if (tool === "pi") {
     return cleanToken(command.match(/(?:^|\s)--session(?:=|\s+)([^\s]+)/i)?.[1]);
+  }
+  if (tool === "omp") {
+    return cleanToken(command.match(/(?:^|\s)(?:--session|--resume|-r)(?:=|\s+)([^\s]+)/i)?.[1]);
   }
   if (tool === "kimi") {
     return cleanToken(command.match(/(?:^|\s)(?:--session|-S)(?:=|\s+)([^\s]+)/i)?.[1]);
@@ -184,6 +188,9 @@ export async function handleSessionMgmt(
       const tool = detectTool(target.command);
       if (tool) {
         sessionRef = extractResumeRef(tool, target.command);
+        if (!sessionRef && tool === "omp") {
+          sessionRef = cleanToken(readSessionManifestSync(target.id)?.jsonlFile || undefined);
+        }
       }
 
       if (!sessionRef) {

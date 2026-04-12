@@ -10,11 +10,11 @@ const RESUME_BUTTON_LIMIT = 10;
 const RESUME_SEARCH_LIMIT = 500;
 const RESUME_TAIL_BYTES = 24 * 1024;
 
-export type ResumeTool = "claude" | "codex" | "pi" | "kimi" | "gemini";
+export type ResumeTool = "claude" | "codex" | "pi" | "omp" | "kimi" | "gemini";
 
 function detectTool(command: string): ResumeTool | null {
   const head = command.trim().split(/\s+/)[0]?.toLowerCase();
-  if (head === "claude" || head === "codex" || head === "pi" || head === "kimi" || head === "gemini") return head;
+  if (head === "claude" || head === "codex" || head === "pi" || head === "omp" || head === "kimi" || head === "gemini") return head;
   return null;
 }
 
@@ -79,22 +79,22 @@ function parseAssistantTextLine(tool: ResumeTool, line: string): string | null {
       const m = msg.message as Record<string, unknown> | undefined;
       if (!m?.content || !Array.isArray(m.content)) return null;
       const texts = (m.content as Array<Record<string, unknown>>)
-        .filter((b) => b.type === "text" && typeof b.text === "string")
-        .map((b) => b.text as string)
-        .join(" ")
-        .trim();
+.filter((b) => b.type === "text" && typeof b.text === "string")
+.map((b) => b.text as string)
+.join(" ")
+.trim();
       return texts || null;
     }
 
-    if (tool === "pi" && msg.type === "message") {
+    if ((tool === "pi" || tool === "omp") && msg.type === "message") {
       const m = msg.message as Record<string, unknown> | undefined;
       if (m?.role !== "assistant") return null;
       if (!m.content || !Array.isArray(m.content)) return null;
       const texts = (m.content as Array<Record<string, unknown>>)
-        .filter((b) => b.type === "text" && typeof b.text === "string")
-        .map((b) => b.text as string)
-        .join(" ")
-        .trim();
+.filter((b) => b.type === "text" && typeof b.text === "string")
+.map((b) => b.text as string)
+.join(" ")
+.trim();
       return texts || null;
     }
 
@@ -161,6 +161,12 @@ function userHomeDir(): string {
   return process.env.HOME || homedir();
 }
 
+function resolveOmpAgentRoot(): string {
+  const configured = process.env.PI_CODING_AGENT_DIR?.trim();
+  if (configured) return configured;
+  return join(userHomeDir(), ".omp", "agent");
+}
+
 function parseCodexSessionId(filePath: string): string {
   const base = stripJsonl(basename(filePath));
   const uuid = base.match(/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i);
@@ -172,6 +178,10 @@ function parsePiSessionToken(filePath: string): string {
   const base = stripJsonl(basename(filePath));
   const parts = base.split("_");
   return parts[parts.length - 1] || base;
+}
+
+function parseOmpSessionToken(filePath: string): string {
+  return parsePiSessionToken(filePath);
 }
 
 function parseKimiSessionId(filePath: string): string {
@@ -257,6 +267,15 @@ function toResumeCandidates(tool: ResumeTool, files: string[]): ResumeSessionCan
       } satisfies ResumeSessionCandidate;
     }
 
+    if (tool === "omp") {
+      const token = parseOmpSessionToken(filePath);
+      return {
+        sessionRef: filePath,
+        label: buildLabel(token, mtimeMs, preview),
+        mtimeMs,
+      } satisfies ResumeSessionCandidate;
+    }
+
     if (tool === "codex") {
       const sessionId = parseCodexSessionId(filePath);
       return {
@@ -299,6 +318,11 @@ export function listRecentSessions(tool: ResumeTool, cwd: string): ResumeSession
 
   if (tool === "pi") {
     const dir = join(userHomeDir(), ".pi", "agent", "sessions", encodedPiDir(cleanCwd));
+    return toResumeCandidates(tool, listJsonlFiles(dir));
+  }
+
+  if (tool === "omp") {
+    const dir = join(resolveOmpAgentRoot(), "sessions", encodedPiDir(cleanCwd));
     return toResumeCandidates(tool, listJsonlFiles(dir));
   }
 
@@ -380,6 +404,7 @@ export const __resumeTestUtils = {
   parseCodexSessionId,
   parseKimiSessionId,
   parseAssistantTextLine,
+  parseOmpSessionToken,
   parsePiSessionToken,
 };
 
@@ -395,14 +420,14 @@ export async function handleResumeCommand(
   if (!remote) {
     await ctx.channel.send(
       chatId,
-      `No connected session for this chat. Start with ${fmt.code("touchgrass claude")} (or ${fmt.code("touchgrass codex")}, ${fmt.code("touchgrass pi")}, ${fmt.code("touchgrass kimi")}) and connect this channel first.`
+      `No connected session for this chat. Start with ${fmt.code("touchgrass claude")} (or ${fmt.code("touchgrass codex")}, ${fmt.code("touchgrass pi")}, ${fmt.code("touchgrass omp")}, ${fmt.code("touchgrass kimi")}, ${fmt.code("touchgrass gemini")}) and connect this channel first.`
     );
     return;
   }
 
   const tool = detectTool(remote.command);
   if (!tool) {
-    await ctx.channel.send(chatId, "Resume picker currently supports Claude, Codex, PI, and Kimi sessions.");
+    await ctx.channel.send(chatId, "Resume picker currently supports Claude, Codex, PI, OMP, Kimi, and Gemini sessions.");
     return;
   }
 

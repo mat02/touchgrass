@@ -339,6 +339,7 @@ const SUPPORTED_COMMANDS: Record<string, string[]> = {
   claude: ["claude"],
   codex: ["codex"],
   pi: ["pi"],
+  omp: ["omp"],
   kimi: ["kimi"],
   gemini: ["gemini"],
 };
@@ -348,6 +349,7 @@ const MIN_TOOL_VERSIONS: Record<string, string> = {
   claude: "2.1.0",
   codex: "0.100.0",
   pi: "0.50.0",
+  omp: "0.1.0",
   kimi: "0.1.0",
   gemini: "0.34.0",
 };
@@ -392,6 +394,13 @@ async function checkToolVersion(tool: string): Promise<void> {
 }
 
 // Get session JSONL directory for the given command
+function resolveOmpAgentRoot(): string {
+  const configured = process.env.PI_CODING_AGENT_DIR?.trim();
+  if (configured) return configured;
+  return join(homedir(), ".omp", "agent");
+}
+
+
 function getSessionDir(command: string): string {
   const cwd = process.cwd();
   if (command === "codex") {
@@ -406,6 +415,11 @@ function getSessionDir(command: string): string {
     // PI session path: ~/.pi/agent/sessions/--<encoded-cwd>--/
     const encoded = "--" + cwd.replace(/^\//, "").replace(/\//g, "-") + "--";
     return join(homedir(), ".pi", "agent", "sessions", encoded);
+  }
+  if (command === "omp") {
+    // OMP session path: ${PI_CODING_AGENT_DIR:-~/.omp/agent}/sessions/--<encoded-cwd>--/
+    const encoded = "--" + cwd.replace(/^\//, "").replace(/[\\/:]/g, "-") + "--";
+    return join(resolveOmpAgentRoot(), "sessions", encoded);
   }
   if (command === "kimi") {
     // Kimi: ~/.kimi/sessions/<md5(cwd)>/<session-id>/wire.jsonl
@@ -650,9 +664,14 @@ const kimiAssistantTextBuffer: string[] = [];
 const kimiAssistantThinkingBuffer: string[] = [];
 
 function parseJsonlMessage(msg: Record<string, unknown>): ParsedMessage {
-  // Gemini format
-  if (typeof msg.type === "string" && (msg.type === "message" || msg.type === "tool_use" || msg.type === "tool_result" || msg.type === "result")) {
-    if (msg.type === "message" && msg.role === "assistant" && typeof msg.content === "string") {
+  // Gemini flat JSON format
+  if (
+    msg.type === "tool_use" ||
+    msg.type === "tool_result" ||
+    msg.type === "result" ||
+    (msg.type === "message" && msg.role === "assistant" && typeof msg.content === "string")
+  ) {
+    if (msg.type === "message") {
       return { ...EMPTY_PARSED, assistantText: msg.content };
     }
     if (msg.type === "tool_use") {
@@ -1687,10 +1706,10 @@ function stripFlagWithOptionalValue(args: string[], longFlag: string, shortFlag?
 const UNSAFE_SESSION_REF = /[;&|`$(){}!#<>\\'"]/;
 
 function buildResumeCommandArgs(
-  command: "claude" | "codex" | "pi" | "kimi" | "gemini",
+  command: "claude" | "codex" | "pi" | "omp" | "kimi" | "gemini",
   currentArgs: string[],
   sessionRef: string
-): string[] {
+  ): string[] {
   // Validate sessionRef to prevent shell injection (command is passed to sh -c in some contexts)
   if (!sessionRef || UNSAFE_SESSION_REF.test(sessionRef)) {
     throw new Error(`Invalid session reference: ${sessionRef}`);
@@ -1722,12 +1741,12 @@ function buildResumeCommandArgs(
 }
 
 export async function runRun(): Promise<void> {
-  // Determine command: `touchgrass claude [args]`, `touchgrass codex [args]`, `touchgrass pi [args]`, `touchgrass kimi [args]`, or `touchgrass gemini [args]`
+  // Determine command: `touchgrass claude [args]`, `touchgrass codex [args]`, `touchgrass pi [args]`, `touchgrass omp [args]`, `touchgrass kimi [args]`, or `touchgrass gemini [args]`
   const initialCmdName = process.argv[2] as SupportedCommand | undefined;
   let cmdArgs = process.argv.slice(3);
 
   if (!initialCmdName || !SUPPORTED_COMMANDS[initialCmdName]) {
-    console.error(`Usage: touchgrass claude [args...], touchgrass codex [args...], touchgrass pi [args...], touchgrass kimi [args...], or touchgrass gemini [args...]`);
+    console.error(`Usage: touchgrass claude [args...], touchgrass codex [args...], touchgrass pi [args...], touchgrass omp [args...], touchgrass kimi [args...], or touchgrass gemini [args...]`);
     process.exit(1);
   }
   let currentTool: SupportedCommand = initialCmdName;
@@ -2002,6 +2021,7 @@ export async function runRun(): Promise<void> {
     // - Claude: --resume <session-id>
     // - Codex: resume <session-id>
     // - PI: --continue/-c (latest session), --session <path>
+    // - OMP: --continue/-c (latest session), --resume/--session <path|id>
     // - Kimi: --session <session-id>, --continue/-C (latest session)
     let resumeSessionFile: string | null = null;
 
@@ -2029,6 +2049,7 @@ export async function runRun(): Promise<void> {
       let resumeId: string | null = null;
       let codexResumeLast = false;
       let kimiResumeContinue = false;
+      let ompResumeRecent = false;
       if (cmdName === "codex") {
         const parsed = parseCodexResumeArgs(cmdArgs);
         resumeId = parsed.resumeId;
@@ -2037,16 +2058,31 @@ export async function runRun(): Promise<void> {
         const parsed = parseKimiResumeArgs(cmdArgs);
         resumeId = parsed.sessionId;
         kimiResumeContinue = parsed.useContinue;
-      } else if (cmdName === "pi") {
-        const sessionIdx = cmdArgs.findIndex((a) => a === "--session");
-        if (sessionIdx !== -1 && sessionIdx + 1 < cmdArgs.length) {
-          resumeId = cmdArgs[sessionIdx + 1];
+      } else if (cmdName === "pi" || cmdName === "omp") {
+        const exactFlags = cmdName === "omp"
+          ? ["--session", "--resume", "-r"]
+          : ["--session"];
+        for (let i = 0; i < cmdArgs.length; i++) {
+          const arg = cmdArgs[i];
+          if (!exactFlags.includes(arg)) continue;
+          const next = cmdArgs[i + 1];
+          if (next && !next.startsWith("-")) {
+            resumeId = next;
+          } else if (cmdName === "omp") {
+            ompResumeRecent = true;
+          }
+          break;
         }
         if (!resumeId) {
-          const sessionEq = cmdArgs.find((a) => a.startsWith("--session="));
-          if (sessionEq) {
-            const value = sessionEq.slice("--session=".length);
+          const inlinePrefixes = cmdName === "omp"
+            ? ["--session=", "--resume=", "-r="]
+            : ["--session="];
+          for (const prefix of inlinePrefixes) {
+            const arg = cmdArgs.find((value) => value.startsWith(prefix));
+            if (!arg) continue;
+            const value = arg.slice(prefix.length);
             if (value) resumeId = value;
+            break;
           }
         }
       } else {
@@ -2068,7 +2104,7 @@ export async function runRun(): Promise<void> {
         try {
           if (cmdName === "kimi") {
             resumeSessionFile = findKimiSessionFileById(projectDir, resumeId);
-          } else if (cmdName === "pi") {
+          } else if (cmdName === "pi" || cmdName === "omp") {
             const candidate = resumeId.endsWith(".jsonl")
               ? (resumeId.startsWith("/") ? resumeId : join(projectDir, resumeId))
               : "";
@@ -2079,7 +2115,6 @@ export async function runRun(): Promise<void> {
               } catch {}
             }
             if (!resumeSessionFile) {
-              // PI fallback: filename match in project dir.
               for (const f of existingFiles) {
                 if (f.includes(resumeId)) {
                   resumeSessionFile = join(projectDir, f);
@@ -2118,8 +2153,12 @@ export async function runRun(): Promise<void> {
         resumeSessionFile = findLatestKimiSessionFile(projectDir);
       }
 
-      // PI --continue/-c: use the most recent JSONL file
-      if (!resumeSessionFile && cmdName === "pi" && (cmdArgs.includes("--continue") || cmdArgs.includes("-c"))) {
+      // PI/OMP continue semantics: use the most recent JSONL file in the project directory.
+      if (
+        !resumeSessionFile &&
+        (cmdName === "pi" || cmdName === "omp") &&
+        (cmdArgs.includes("--continue") || cmdArgs.includes("-c") || ompResumeRecent)
+      ) {
         try {
           let newest = "";
           let newestMtime = 0;
@@ -2645,7 +2684,7 @@ export async function runRun(): Promise<void> {
     if (watcherRef.dir) watcherRef.dir.close();
 
     if (requestedResumeSessionRef) {
-      cmdArgs = buildResumeCommandArgs(cmdName as "claude" | "codex" | "pi" | "kimi" | "gemini", cmdArgs, requestedResumeSessionRef);
+      cmdArgs = buildResumeCommandArgs(cmdName as "claude" | "codex" | "pi" | "omp" | "kimi" | "gemini", cmdArgs, requestedResumeSessionRef);
       continue;
     }
 
@@ -2718,7 +2757,7 @@ export async function runRun(): Promise<void> {
       }
 
       if (requestedResumeSessionRef) {
-        cmdArgs = buildResumeCommandArgs(cmdName as "claude" | "codex" | "pi" | "kimi" | "gemini", cmdArgs, requestedResumeSessionRef);
+        cmdArgs = buildResumeCommandArgs(cmdName as "claude" | "codex" | "pi" | "omp" | "kimi" | "gemini", cmdArgs, requestedResumeSessionRef);
         continue;
       }
     }

@@ -121,7 +121,7 @@ function extractEntries(msg: Record<string, unknown>): DisplayEntry[] {
     return entries;
   }
 
-  // PI format: {"type":"message","message":{"role":"assistant"|"user",...}}
+  // PI / OMP format: {"type":"message","message":{...}}
   if (msg.type === "message") {
     const m = msg.message as Record<string, unknown> | undefined;
     if (!m) return entries;
@@ -150,6 +150,15 @@ function extractEntries(msg: Record<string, unknown>): DisplayEntry[] {
           if (text) entries.push({ role: "user", text });
         }
       }
+    }
+    if (role === "toolResult" && m.content && Array.isArray(m.content)) {
+      const toolName = (m.toolName as string) || idToName.get((m.toolCallId as string) || "") || "tool";
+      const text = (m.content as Array<Record<string, unknown>>)
+        .filter((block) => block.type === "text" && typeof block.text === "string")
+        .map((block) => block.text as string)
+        .join("\n")
+        .trim();
+      if (text) entries.push({ role: "tool", text: `${toolName}: ${truncate(text, 120)}` });
     }
     return entries;
   }

@@ -365,6 +365,59 @@ describe("background job parser", () => {
     ]);
   });
 
+  it("parses OMP session messages and ignores session headers", () => {
+    __cliRunTestUtils.resetParserState();
+
+    const headerParsed = __cliRunTestUtils.parseJsonlMessage({
+      type: "session",
+      version: 3,
+      id: "1f9d2a6b9c0d1234",
+      cwd: "/tmp/repo",
+    });
+    expect(headerParsed.assistantText).toBeNull();
+    expect(headerParsed.toolCalls).toEqual([]);
+
+    const assistantParsed = __cliRunTestUtils.parseJsonlMessage({
+      type: "message",
+      message: {
+        role: "assistant",
+        content: [
+          { type: "thinking", thinking: "checking workspace" },
+          { type: "text", text: "I found the failing file." },
+          { type: "toolCall", id: "omp-call-1", name: "web_search", arguments: { query: "touchgrass omp" } },
+        ],
+      },
+    });
+
+    expect(assistantParsed.assistantText).toBe("I found the failing file.");
+    expect(assistantParsed.thinking).toBe("checking workspace");
+    expect(assistantParsed.toolCalls).toEqual([
+      {
+        id: "omp-call-1",
+        name: "web_search",
+        input: { query: "touchgrass omp" },
+      },
+    ]);
+
+    const resultParsed = __cliRunTestUtils.parseJsonlMessage({
+      type: "message",
+      message: {
+        role: "toolResult",
+        toolCallId: "omp-call-1",
+        content: [{ type: "text", text: "Result A" }],
+        isError: false,
+      },
+    });
+
+    expect(resultParsed.toolResults).toEqual([
+      {
+        toolName: "web_search",
+        content: "Result A",
+        isError: false,
+      },
+    ]);
+  });
+
   it("forwards Claude Task tool results for simple-mode summarization", () => {
     __cliRunTestUtils.resetParserState();
 

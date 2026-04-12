@@ -55,7 +55,7 @@ describe("session command", () => {
         `<agent-soul>\nName: Builder\nPurpose: Ship changes\n</agent-soul>\n`
       );
       ctx.sessionManager.registerRemote(
-        "codex --dangerously-bypass-approvals-and-sandbox",
+        "omp --session /tmp/omp-session.jsonl",
         "telegram:100",
         "telegram:1",
         root,
@@ -74,7 +74,7 @@ describe("session command", () => {
       expect(sent[0]).toContain("Agent:");
       expect(sent[0]).toContain("Builder");
       expect(sent[0]).toContain("Tool:");
-      expect(sent[0]).toContain("codex");
+      expect(sent[0]).toContain("omp");
       expect(sent[0]).toContain("Project:");
       expect(sent[0]).toContain(root.split("/").pop() || "");
       expect(sent[0]).not.toContain("Resume picker");

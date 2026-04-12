@@ -541,13 +541,13 @@ export async function runInit(): Promise<void> {
     if (pairingCode) {
       console.log("  1. Send /pair <code> to your bot in Telegram DM");
       console.log("  2. (Optional) In Telegram groups/topics, send /link");
-      console.log("  3. touchgrass claude    (or touchgrass codex, touchgrass pi, touchgrass kimi) Start with chat bridge");
+      console.log("  3. touchgrass claude    (or touchgrass codex, touchgrass pi, touchgrass omp, touchgrass kimi, touchgrass gemini) Start with chat bridge");
       console.log("  4. touchgrass pair      Generate another pairing code later if needed");
     } else {
       console.log("  1. touchgrass pair      Generate a pairing code");
       console.log("  2. Send /pair <code> to your bot in Telegram DM");
       console.log("  3. (Optional) In Telegram groups/topics, send /link");
-      console.log("  4. touchgrass claude    (or touchgrass codex, touchgrass pi, touchgrass kimi) Start with chat bridge");
+      console.log("  4. touchgrass claude    (or touchgrass codex, touchgrass pi, touchgrass omp, touchgrass kimi, touchgrass gemini) Start with chat bridge");
     }
   } finally {
     rl.close();

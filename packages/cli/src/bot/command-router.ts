@@ -150,7 +150,7 @@ export async function routeMessage(
   if (text === "/mute" || text === "/unmute" || text === "/stop" || text === "/kill" || text === "/new" || text === "/start" || text.startsWith("/start ") || text.startsWith("/new ")) {
     await ctx.channel.send(
       chatId,
-      `${fmt.escape("⛳️ Chat-side session start/stop was removed. Start sessions from your terminal with")} ${fmt.code("touchgrass claude")}, ${fmt.code("touchgrass codex")}, ${fmt.code("touchgrass pi")}, ${fmt.code("touchgrass kimi")} ${fmt.escape("and use")} ${fmt.code("touchgrass stop <id>")} ${fmt.escape("or")} ${fmt.code("touchgrass kill <id>")} ${fmt.escape("from terminal when needed.")}`
+      `${fmt.escape("⛳️ Chat-side session start/stop was removed. Start sessions from your terminal with")} ${fmt.code("touchgrass claude")}, ${fmt.code("touchgrass codex")}, ${fmt.code("touchgrass pi")}, ${fmt.code("touchgrass omp")}, ${fmt.code("touchgrass kimi")}, ${fmt.code("touchgrass gemini")} ${fmt.escape("and use")} ${fmt.code("touchgrass stop <id>")} ${fmt.escape("or")} ${fmt.code("touchgrass kill <id>")} ${fmt.escape("from terminal when needed.")}`
     );
     return;
   }
@@ -393,7 +393,7 @@ export async function routeMessage(
 
     await ctx.channel.send(
       chatId,
-      `Unknown command. Use ${fmt.code("touchgrass session")}, ${fmt.code("touchgrass name <value>")}, ${fmt.code("touchgrass resume")}, ${fmt.code("touchgrass output_mode simple|thinking|verbose")}, ${fmt.code("touchgrass attach <id>")}, ${fmt.code("touchgrass detach")}, ${fmt.code("touchgrass stop <id>")}, ${fmt.code("touchgrass kill <id>")}, or ${fmt.code("touchgrass restart [session_id]")}. Start sessions from your terminal with ${fmt.code("touchgrass claude")}, ${fmt.code("touchgrass codex")}, ${fmt.code("touchgrass pi")}, or ${fmt.code("touchgrass kimi")}.`
+      `Unknown command. Use ${fmt.code("touchgrass session")}, ${fmt.code("touchgrass name <value>")}, ${fmt.code("touchgrass resume")}, ${fmt.code("touchgrass output_mode simple|thinking|verbose")}, ${fmt.code("touchgrass attach <id>")}, ${fmt.code("touchgrass detach")}, ${fmt.code("touchgrass stop <id>")}, ${fmt.code("touchgrass kill <id>")}, or ${fmt.code("touchgrass restart [session_id]")}. Start sessions from your terminal with ${fmt.code("touchgrass claude")}, ${fmt.code("touchgrass codex")}, ${fmt.code("touchgrass pi")}, ${fmt.code("touchgrass omp")}, ${fmt.code("touchgrass kimi")}, or ${fmt.code("touchgrass gemini")}.`
     );
     return;
   }

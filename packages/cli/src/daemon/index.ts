@@ -344,7 +344,7 @@ export async function startDaemon(): Promise<void> {
     return Array.from(merged).slice(0, 5);
   };
 
-  type ResumableTool = "claude" | "codex" | "pi" | "kimi";
+  type ResumableTool = "claude" | "codex" | "pi" | "omp" | "kimi" | "gemini";
 
   const cleanResumeRef = (token: string | undefined): string | null => {
     if (!token) return null;
@@ -358,13 +358,16 @@ export async function startDaemon(): Promise<void> {
 
   const detectResumableTool = (command: string): ResumableTool | null => {
     const tool = getSessionTool(command).toLowerCase();
-    if (tool === "claude" || tool === "codex" || tool === "pi" || tool === "kimi") return tool;
+    if (tool === "claude" || tool === "codex" || tool === "pi" || tool === "omp" || tool === "kimi" || tool === "gemini") return tool;
     return null;
   };
 
   const extractResumeRefFromCommand = (tool: ResumableTool, command: string): string | null => {
     if (tool === "pi") {
       return cleanResumeRef(command.match(/(?:^|\s)--session(?:=|\s+)([^\s]+)/i)?.[1]);
+    }
+    if (tool === "omp") {
+      return cleanResumeRef(command.match(/(?:^|\s)(?:--session|--resume|-r)(?:=|\s+)([^\s]+)/i)?.[1]);
     }
     if (tool === "kimi") {
       return cleanResumeRef(command.match(/(?:^|\s)(?:--session|-S)(?:=|\s+)([^\s]+)/i)?.[1]);
@@ -522,6 +525,19 @@ export async function startDaemon(): Promise<void> {
       await fd.close();
     }
   };
+
+  const readSessionManifestSync = (sessionId: string): SessionManifest | null => {
+    const manifestPath = join(paths.sessionsDir, `${sessionId}.json`);
+    try {
+      const raw = require("fs").readFileSync(manifestPath, "utf-8") as string;
+      const parsed = JSON.parse(raw) as SessionManifest;
+      if (!parsed || typeof parsed !== "object") return null;
+      return parsed;
+    } catch {
+      return null;
+    }
+  };
+
 
   const readSessionManifest = async (sessionId: string): Promise<SessionManifest | null> => {
     const manifestPath = join(paths.sessionsDir, `${sessionId}.json`);
@@ -2159,6 +2175,9 @@ export async function startDaemon(): Promise<void> {
           return { ok: false, error: "Current session command does not support resume restart" };
         }
         resolvedSessionRef = extractResumeRefFromCommand(tool, remote.command);
+        if (!resolvedSessionRef && tool === "omp") {
+          resolvedSessionRef = cleanResumeRef(readSessionManifestSync(sessionId)?.jsonlFile || undefined);
+        }
         if (!resolvedSessionRef) {
           return { ok: false, error: "Could not infer resume session ID; pass --session <tool_session_id>" };
         }

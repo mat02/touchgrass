@@ -4,11 +4,11 @@ import { readAgentSoul } from "../../daemon/agent-soul";
 import type { RouterContext } from "../command-router";
 import { basename } from "path";
 
-type SessionTool = "claude" | "codex" | "pi" | "kimi" | "gemini";
+type SessionTool = "claude" | "codex" | "pi" | "omp" | "kimi" | "gemini";
 
 function detectTool(command: string): SessionTool | null {
   const head = command.trim().split(/\s+/)[0]?.toLowerCase();
-  if (head === "claude" || head === "codex" || head === "pi" || head === "kimi" || head === "gemini") return head;
+  if (head === "claude" || head === "codex" || head === "pi" || head === "omp" || head === "kimi" || head === "gemini") return head;
   return null;
 }
 
@@ -31,7 +31,7 @@ export async function handleSessionCommand(
   if (!remote) {
     await ctx.channel.send(
       msg.chatId,
-      `No connected touchgrass session for this chat. Start with ${fmt.code("touchgrass claude")} (or ${fmt.code("touchgrass codex")}, ${fmt.code("touchgrass pi")}, ${fmt.code("touchgrass kimi")}) and connect this channel first.`
+      `No connected touchgrass session for this chat. Start with ${fmt.code("touchgrass claude")} (or ${fmt.code("touchgrass codex")}, ${fmt.code("touchgrass pi")}, ${fmt.code("touchgrass omp")}, ${fmt.code("touchgrass kimi")}, ${fmt.code("touchgrass gemini")}) and connect this channel first.`
     );
     return;
   }

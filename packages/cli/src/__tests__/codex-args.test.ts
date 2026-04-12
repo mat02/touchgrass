@@ -127,6 +127,21 @@ describe("resume restart arg building", () => {
     expect(args).not.toContain("old-kimi-session");
     expect(args).not.toContain("--continue");
   });
+
+  it("uses --session for omp and strips resume-style flags", () => {
+    const args = __cliRunTestUtils.buildResumeCommandArgs(
+      "omp",
+      ["--model", "claude-sonnet-4-5", "--continue", "--resume", "old-omp-session"],
+      "/tmp/new-omp-session.jsonl"
+    );
+
+    expect(args).toContain("--model");
+    expect(args).toContain("claude-sonnet-4-5");
+    expect(args.slice(-2)).toEqual(["--session", "/tmp/new-omp-session.jsonl"]);
+    expect(args).not.toContain("old-omp-session");
+    expect(args).not.toContain("--continue");
+    expect(args).not.toContain("--resume");
+  });
 });
 
 describe("run setup preflight", () => {

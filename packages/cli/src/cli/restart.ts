@@ -1,7 +1,7 @@
 import { daemonRequest } from "./client";
 import { ensureDaemon } from "./ensure-daemon";
 
-type ResumableTool = "claude" | "codex" | "pi" | "kimi" | "gemini";
+type ResumableTool = "claude" | "codex" | "pi" | "omp" | "kimi" | "gemini";
 
 interface ActiveSession {
   id: string;
@@ -21,13 +21,16 @@ function cleanToken(token: string | undefined): string | null {
 
 function detectTool(command: string): ResumableTool | null {
   const head = command.trim().split(/\s+/)[0]?.toLowerCase();
-  if (head === "claude" || head === "codex" || head === "pi" || head === "kimi" || head === "gemini") return head;
+  if (head === "claude" || head === "codex" || head === "pi" || head === "omp" || head === "kimi" || head === "gemini") return head;
   return null;
 }
 
 function extractResumeRef(tool: ResumableTool, command: string): string | null {
   if (tool === "pi") {
     return cleanToken(command.match(/(?:^|\s)--session(?:=|\s+)([^\s]+)/i)?.[1]);
+  }
+  if (tool === "omp") {
+    return cleanToken(command.match(/(?:^|\s)(?:--session|--resume|-r)(?:=|\s+)([^\s]+)/i)?.[1]);
   }
   if (tool === "kimi") {
     return cleanToken(command.match(/(?:^|\s)(?:--session|-S)(?:=|\s+)([^\s]+)/i)?.[1]);
@@ -104,15 +107,16 @@ export async function runRestart(): Promise<void> {
     sessionRef = extractResumeRef(tool, target.command);
   }
 
-  if (!sessionRef) {
+  if (!sessionRef && tool !== "omp") {
     console.error(
       "Could not infer a tool session ID from the current command. Run touchgrass resume first, then touchgrass restart."
     );
     process.exit(1);
   }
 
-  await daemonRequest(`/session/${target.id}/restart`, "POST");
-  console.log(`Requested restart for touchgrass session ${target.id} using tool session ${sessionRef}`);
+  const restart = await daemonRequest(`/session/${target.id}/restart`, "POST", sessionRef ? { sessionRef } : {});
+  const resolvedSessionRef = cleanToken(typeof restart.sessionRef === "string" ? restart.sessionRef : undefined) || sessionRef;
+  console.log(`Requested restart for touchgrass session ${target.id} using tool session ${resolvedSessionRef || "(daemon-resolved)"}`);
 }
 
 export const __restartTestUtils = {

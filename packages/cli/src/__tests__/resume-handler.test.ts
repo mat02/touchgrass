@@ -55,7 +55,7 @@ describe("resume picker pagination", () => {
 });
 
 describe("resume session discovery", () => {
-  it("extracts codex and pi session tokens from filenames", () => {
+  it("extracts codex, pi, and omp session tokens from filenames", () => {
     expect(
       __resumeTestUtils.parseCodexSessionId(
         "/tmp/rollout-2026-01-12T21-49-45-019bb3f8-cb68-72f0-8542-afbcbb5207f8.jsonl"
@@ -67,6 +67,12 @@ describe("resume session discovery", () => {
         "/tmp/2026-02-11T22-17-53-914Z_4f5814e4-8823-4d1b-ba68-8dbab84c5ca4.jsonl"
       )
     ).toBe("4f5814e4-8823-4d1b-ba68-8dbab84c5ca4");
+
+    expect(
+      __resumeTestUtils.parseOmpSessionToken(
+        "/tmp/2026-02-11T22-17-53-914Z_1f9d2a6b9c0d1234.jsonl"
+      )
+    ).toBe("1f9d2a6b9c0d1234");
 
     expect(
       __resumeTestUtils.parseKimiSessionId(
@@ -148,6 +154,19 @@ describe("resume session discovery", () => {
         }) + "\n"
       );
 
+      const ompDir = join(root, ".omp", "agent", "sessions", "--tmp-repo--");
+      mkdirSync(ompDir, { recursive: true });
+      const ompFile = join(ompDir, "2026-02-15T11-30-00-000Z_1f9d2a6b9c0d1234.jsonl");
+      writeFileSync(
+        ompFile,
+        JSON.stringify({ type: "session", version: 3, id: "1f9d2a6b9c0d1234", cwd: "/tmp/repo" }) + "\n" +
+          JSON.stringify({
+            type: "message",
+            message: { role: "assistant", content: [{ type: "text", text: "omp says hello" }] },
+          }) + "\n"
+      );
+      utimesSync(ompFile, new Date(), new Date("2026-02-15T11:30:00.000Z"));
+
       const kimiProjectHash = createHash("md5").update("/tmp/repo").digest("hex");
       const kimiSessionDir = join(root, ".kimi", "sessions", kimiProjectHash, "399cb3b5-2e50-4a59-a6c8-e13e61f3eb7d");
       mkdirSync(kimiSessionDir, { recursive: true });
@@ -182,6 +201,11 @@ describe("resume session discovery", () => {
       expect(piSessions[0]?.sessionRef).toBe(piFile);
       expect(piSessions[0]?.label).toContain("pi says hello");
       expect(piSessions[0]?.label).toContain("ago:");
+
+      const ompSessions = __resumeTestUtils.listRecentSessions("omp", "/tmp/repo");
+      expect(ompSessions[0]?.sessionRef).toBe(ompFile);
+      expect(ompSessions[0]?.label).toContain("omp says hello");
+      expect(ompSessions[0]?.label).toContain("ago:");
 
       const kimiSessions = __resumeTestUtils.listRecentSessions("kimi", "/tmp/repo");
       expect(kimiSessions[0]?.sessionRef).toBe("399cb3b5-2e50-4a59-a6c8-e13e61f3eb7d");
@@ -238,6 +262,17 @@ describe("resume session discovery", () => {
       );
       expect(__resumeTestUtils.extractLastAssistantPreview("pi", piFile)).toContain("PI output");
 
+      const ompFile = join(root, "omp.jsonl");
+      writeFileSync(
+        ompFile,
+        JSON.stringify({ type: "session", version: 3, id: "1f9d2a6b9c0d1234", cwd: "/tmp/repo" }) + "\n" +
+          JSON.stringify({
+            type: "message",
+            message: { role: "assistant", content: [{ type: "text", text: "OMP output line" }] },
+          }) + "\n"
+      );
+      expect(__resumeTestUtils.extractLastAssistantPreview("omp", ompFile)).toContain("OMP output");
+
       const kimiFile = join(root, "kimi-wire.jsonl");
       writeFileSync(
         kimiFile,
@@ -259,6 +294,7 @@ describe("resume handler", () => {
     expect(__resumeTestUtils.detectTool("claude --dangerously-skip-permissions")).toBe("claude");
     expect(__resumeTestUtils.detectTool("codex resume abc")).toBe("codex");
     expect(__resumeTestUtils.detectTool("pi --mode json")).toBe("pi");
+    expect(__resumeTestUtils.detectTool("omp --resume abc")).toBe("omp");
     expect(__resumeTestUtils.detectTool("kimi --model kimi-k2")).toBe("kimi");
     expect(__resumeTestUtils.detectTool("gemini --some-flag")).toBe("gemini");
     expect(__resumeTestUtils.detectTool("bash")).toBeNull();

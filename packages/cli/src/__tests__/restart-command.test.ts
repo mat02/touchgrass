@@ -47,14 +47,23 @@ describe("restart command resume extraction", () => {
     expect(__restartTestUtils.extractResumeRef("codex", command)).toBe("019c56ac-417b-7180-bd3f-2ed6e25885e3");
   });
 
-  it("detects gemini tool", () => {
+  it("detects gemini and omp tools", () => {
     expect(__restartTestUtils.detectTool("gemini resume 123")).toBe("gemini");
+    expect(__restartTestUtils.detectTool("omp --resume 123")).toBe("omp");
   });
 
-  it("extracts pi and kimi session refs from --session/-S flags", () => {
+  it("extracts pi, omp, kimi, and gemini session refs from resume flags", () => {
     expect(
       __restartTestUtils.extractResumeRef("pi", "pi --provider google --session /tmp/pi-session.jsonl")
     ).toBe("/tmp/pi-session.jsonl");
+
+    expect(
+      __restartTestUtils.extractResumeRef("omp", "omp --resume omp-session-1")
+    ).toBe("omp-session-1");
+
+    expect(
+      __restartTestUtils.extractResumeRef("omp", "omp --session /tmp/omp-session.jsonl")
+    ).toBe("/tmp/omp-session.jsonl");
 
     expect(
       __restartTestUtils.extractResumeRef("kimi", "kimi --model kimi-k2 -S kimi-session-1")

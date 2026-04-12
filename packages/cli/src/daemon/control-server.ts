@@ -213,7 +213,7 @@ export async function startControlServer(ctx: DaemonContext): Promise<void> {
       // GET /sessions/recent?tool=claude&cwd=/path — list resumable sessions
       if (path === "/sessions/recent") {
         const url = new URL(req.url, "http://localhost");
-        const tool = url.searchParams.get("tool") as "claude" | "codex" | "pi" | "kimi" | null;
+        const tool = url.searchParams.get("tool") as "claude" | "codex" | "pi" | "omp" | "kimi" | null;
         const cwd = url.searchParams.get("cwd");
         if (!tool || !cwd) {
           return Response.json({ ok: false, error: "tool and cwd required" }, { status: 400 });
