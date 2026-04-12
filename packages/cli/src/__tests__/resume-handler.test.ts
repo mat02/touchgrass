@@ -154,7 +154,7 @@ describe("resume session discovery", () => {
         }) + "\n"
       );
 
-      const ompDir = join(root, ".omp", "agent", "sessions", "--tmp-repo--");
+      const ompDir = join(root, ".omp", "agent", "sessions", "-repo");
       mkdirSync(ompDir, { recursive: true });
       const ompFile = join(ompDir, "2026-02-15T11-30-00-000Z_1f9d2a6b9c0d1234.jsonl");
       writeFileSync(

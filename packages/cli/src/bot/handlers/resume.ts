@@ -5,6 +5,7 @@ import { createHash } from "crypto";
 import type { InboundMessage } from "../../channel/types";
 import type { RouterContext } from "../command-router";
 import type { PendingResumePickerOption, RemoteSession, ResumeSessionCandidate } from "../../session/manager";
+import { listOmpSessionFiles } from "../../session/omp";
 
 const RESUME_BUTTON_LIMIT = 10;
 const RESUME_SEARCH_LIMIT = 500;
@@ -161,11 +162,6 @@ function userHomeDir(): string {
   return process.env.HOME || homedir();
 }
 
-function resolveOmpAgentRoot(): string {
-  const configured = process.env.PI_CODING_AGENT_DIR?.trim();
-  if (configured) return configured;
-  return join(userHomeDir(), ".omp", "agent");
-}
 
 function parseCodexSessionId(filePath: string): string {
   const base = stripJsonl(basename(filePath));
@@ -322,8 +318,7 @@ export function listRecentSessions(tool: ResumeTool, cwd: string): ResumeSession
   }
 
   if (tool === "omp") {
-    const dir = join(resolveOmpAgentRoot(), "sessions", encodedPiDir(cleanCwd));
-    return toResumeCandidates(tool, listJsonlFiles(dir));
+    return toResumeCandidates(tool, listOmpSessionFiles(cleanCwd, RESUME_SEARCH_LIMIT));
   }
 
   if (tool === "gemini") {

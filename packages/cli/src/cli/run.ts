@@ -14,6 +14,7 @@ import { homedir, platform } from "os";
 import { join, basename } from "path";
 import { createHash } from "crypto";
 import { parseRemoteControlAction } from "../session/remote-control";
+import { listOmpSessionFiles, resolveOmpSessionsRoot } from "../session/omp";
 import {
   readSessionManifestSync,
   removeSessionManifest,
@@ -394,13 +395,6 @@ async function checkToolVersion(tool: string): Promise<void> {
 }
 
 // Get session JSONL directory for the given command
-function resolveOmpAgentRoot(): string {
-  const configured = process.env.PI_CODING_AGENT_DIR?.trim();
-  if (configured) return configured;
-  return join(homedir(), ".omp", "agent");
-}
-
-
 function getSessionDir(command: string): string {
   const cwd = process.cwd();
   if (command === "codex") {
@@ -417,9 +411,8 @@ function getSessionDir(command: string): string {
     return join(homedir(), ".pi", "agent", "sessions", encoded);
   }
   if (command === "omp") {
-    // OMP session path: ${PI_CODING_AGENT_DIR:-~/.omp/agent}/sessions/--<encoded-cwd>--/
-    const encoded = "--" + cwd.replace(/^\//, "").replace(/[\\/:]/g, "-") + "--";
-    return join(resolveOmpAgentRoot(), "sessions", encoded);
+    // OMP session discovery scans the shared sessions root because bucket names can vary.
+    return resolveOmpSessionsRoot();
   }
   if (command === "kimi") {
     // Kimi: ~/.kimi/sessions/<md5(cwd)>/<session-id>/wire.jsonl
@@ -2033,6 +2026,10 @@ export async function runRun(): Promise<void> {
         for (const filePath of listKimiSessionWireFiles(projectDir)) {
           existingFiles.add(filePath);
         }
+      } else if (cmdName === "omp") {
+        for (const filePath of listOmpSessionFiles(process.cwd())) {
+          existingFiles.add(filePath);
+        }
       } else {
         try {
           for (const f of readdirSync(projectDir)) {
@@ -2104,7 +2101,7 @@ export async function runRun(): Promise<void> {
         try {
           if (cmdName === "kimi") {
             resumeSessionFile = findKimiSessionFileById(projectDir, resumeId);
-          } else if (cmdName === "pi" || cmdName === "omp") {
+          } else if (cmdName === "pi") {
             const candidate = resumeId.endsWith(".jsonl")
               ? (resumeId.startsWith("/") ? resumeId : join(projectDir, resumeId))
               : "";
@@ -2118,6 +2115,24 @@ export async function runRun(): Promise<void> {
               for (const f of existingFiles) {
                 if (f.includes(resumeId)) {
                   resumeSessionFile = join(projectDir, f);
+                  break;
+                }
+              }
+            }
+          } else if (cmdName === "omp") {
+            const candidate = resumeId.endsWith(".jsonl")
+              ? (resumeId.startsWith("/") ? resumeId : join(projectDir, resumeId))
+              : "";
+            if (candidate) {
+              try {
+                const st = statSync(candidate);
+                if (st.isFile()) resumeSessionFile = candidate;
+              } catch {}
+            }
+            if (!resumeSessionFile) {
+              for (const filePath of existingFiles) {
+                if (filePath.includes(resumeId)) {
+                  resumeSessionFile = filePath;
                   break;
                 }
               }
@@ -2153,7 +2168,7 @@ export async function runRun(): Promise<void> {
         resumeSessionFile = findLatestKimiSessionFile(projectDir);
       }
 
-      // PI/OMP continue semantics: use the most recent JSONL file in the project directory.
+      // PI/OMP continue semantics: use the most recent JSONL file for the current project.
       if (
         !resumeSessionFile &&
         (cmdName === "pi" || cmdName === "omp") &&
@@ -2163,13 +2178,14 @@ export async function runRun(): Promise<void> {
           let newest = "";
           let newestMtime = 0;
           for (const f of existingFiles) {
-            const s = statSync(join(projectDir, f));
+            const filePath = cmdName === "omp" ? f : join(projectDir, f);
+            const s = statSync(filePath);
             if (s.mtimeMs > newestMtime) {
               newestMtime = s.mtimeMs;
-              newest = f;
+              newest = filePath;
             }
           }
-          if (newest) resumeSessionFile = join(projectDir, newest);
+          if (newest) resumeSessionFile = newest;
         } catch {}
       }
     }
@@ -2442,6 +2458,20 @@ export async function runRun(): Promise<void> {
           } catch {}
           return;
         }
+        if (cmdName === "omp") {
+          try {
+            const unseen = listOmpSessionFiles(process.cwd())
+              .filter((filePath) => !existingFiles.has(filePath));
+            for (const filePath of unseen) {
+              existingFiles.add(filePath);
+              if (!watcherRef.current) {
+                startFileWatch(filePath);
+                return;
+              }
+            }
+          } catch {}
+          return;
+        }
 
         try {
           for (const f of readdirSync(projectDir)) {
@@ -2450,7 +2480,7 @@ export async function runRun(): Promise<void> {
             } else {
               if (!f.endsWith(".jsonl")) continue;
             }
-            
+
             if (existingFiles.has(f)) continue;
             console.error(`Found new session file in directory scan: ${f}`);
             existingFiles.add(f);
@@ -2462,13 +2492,13 @@ export async function runRun(): Promise<void> {
             maybeSwitchToRolloverSession(filePath);
           }
         } catch (err) {
-           if (cmdName === "gemini") console.error("Error reading projectDir:", err);
+          if (cmdName === "gemini") console.error("Error reading projectDir:", err);
         }
       };
 
       // Watch the project directory for new .jsonl files
       try {
-        if (cmdName === "kimi") {
+        if (cmdName === "kimi" || cmdName === "omp") {
           watcherRef.dir = watch(projectDir, () => {
             checkForNewFiles();
           });
@@ -2506,8 +2536,8 @@ export async function runRun(): Promise<void> {
       }, 500);
       setTimeout(() => clearInterval(bootstrapScanTimer), 30_000);
 
-      // Keep scanning for Claude rollovers and Kimi nested session files.
-      if (cmdName === "claude" || cmdName === "kimi" || cmdName === "gemini") {
+      // Keep scanning for Claude rollovers and nested-session tools.
+      if (cmdName === "claude" || cmdName === "kimi" || cmdName === "omp" || cmdName === "gemini") {
         dirScanTimer = setInterval(() => {
           checkForNewFiles();
         }, 2000);
