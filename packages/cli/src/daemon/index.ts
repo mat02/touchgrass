@@ -1,15 +1,15 @@
 import { loadConfig, invalidateCache, saveConfig } from "../config/store";
 import {
   addLinkedGroup,
+  applyChatTranscriptPreset,
   getAllLinkedGroups,
   getAllPairedUsers,
   getChatMuted,
-  getChatOutputMode,
+  getChatOutputPreferences,
   getTelegramBotToken,
   isLinkedGroup,
   removeLinkedGroup,
-  setChatOutputMode,
-  type OutputMode,
+  setChatOutputPreferences,
 } from "../config/schema";
 import { TelegramApi } from "../channels/telegram/api";
 import { logger } from "./logger";
@@ -26,6 +26,11 @@ import {
 } from "./lifecycle";
 import { startControlServer, type ChannelInfo, type ConfigChannelSummary, type ConfigChannelDetails } from "./control-server";
 import { routeMessage } from "../bot/command-router";
+import {
+  buildOutputModeSummaryMessage,
+  buildOutputPickerPrompt,
+  getNextOutputWizardStep,
+} from "../bot/handlers/output-mode";
 import type { BackgroundJobSessionSummary } from "../bot/handlers/background-jobs";
 import { SessionManager } from "../session/manager";
 import { formatSimpleToolResult, formatToolCall } from "./tool-display";
@@ -38,11 +43,11 @@ import { InternalChannel } from "../channels/internal/channel";
 import type { Formatter } from "../channel/formatter";
 import type { Channel, ChannelChatId, ChannelUserId } from "../channel/types";
 import { getChannelName, getChannelType, getRootChatIdNumber, parseChannelAddress } from "../channel/id";
-import type { AskQuestion, PendingFilePickerOption, PendingRecentMessagesPoll } from "../session/manager";
+import type { AskQuestion, PendingFilePickerOption, PendingOutputModeOption, PendingRecentMessagesPoll } from "../session/manager";
 import { readManifests } from "../bot/handlers/remote-control";
 import { collectEntriesFromRaw, type DisplayEntry } from "../cli/peek";
 import { chmod, open, readFile, realpath, stat, writeFile } from "fs/promises";
-import { basename, join, resolve } from "path";
+import { basename, dirname, join, resolve } from "path";
 
 const DAEMON_STARTED_AT = Date.now();
 
@@ -152,7 +157,7 @@ export async function startDaemon(): Promise<void> {
   const getFormatterForChat = (chatId: ChannelChatId): Formatter => {
     return getChannelForChat(chatId)?.fmt || channels[0].channel.fmt;
   };
-  const getOutputModeForChat = (chatId: ChannelChatId) => getChatOutputMode(config, chatId);
+  const getOutputPreferencesForChat = (chatId: ChannelChatId) => getChatOutputPreferences(config, chatId);
   const isChatMutedForChat = (chatId: ChannelChatId): boolean => {
     return getChatMuted(config, chatId);
   };
@@ -195,7 +200,12 @@ export async function startDaemon(): Promise<void> {
   const setTypingForChat = (chatId: ChannelChatId, active: boolean): void => {
     const channel = getChannelForChat(chatId);
     if (!channel) return;
-    channel.setTyping(chatId, active);
+    if (!active) {
+      channel.setTyping(chatId, false);
+      return;
+    }
+    if (!getOutputPreferencesForChat(chatId).typingIndicator) return;
+    channel.setTyping(chatId, true);
   };
   const syncKnownCommandMenus = (): void => {
     const pairedUsers = getAllPairedUsers(config);
@@ -1073,6 +1083,7 @@ export async function startDaemon(): Promise<void> {
 
     for (const chatId of getBackgroundTargets(sessionId)) {
       if (isChatMutedForChat(chatId)) continue;
+      if (!getOutputPreferencesForChat(chatId).backgroundJobs) continue;
       const fmt = getFormatterForChat(chatId);
       const lines: string[] = [
         `${fmt.escape(emoji)} ${fmt.bold(fmt.escape(label))}`,
@@ -1131,6 +1142,17 @@ export async function startDaemon(): Promise<void> {
       const channel = getChannelForChat(chatId);
       if (!channel) continue;
       const persisted = persistedStatusBoards.get(statusBoardMapKey(chatId, key));
+      if (!getOutputPreferencesForChat(chatId).backgroundJobs) {
+        try {
+          await channel.clearStatusBoard?.(chatId, key, {
+            unpin: true,
+            messageId: persisted?.messageId,
+            pinned: persisted?.pinned,
+          });
+        } catch {}
+        removePersistedStatusBoard(chatId, key);
+        continue;
+      }
       if (jobs.length === 0) {
         try {
           await channel.clearStatusBoard?.(chatId, key, {
@@ -1555,22 +1577,68 @@ export async function startDaemon(): Promise<void> {
       }
 
       sessionManager.removeOutputModePicker(answer.pollId);
-
       const selectedIdx = answer.optionIds[0];
       if (!Number.isFinite(selectedIdx)) return;
       if (selectedIdx < 0 || selectedIdx >= outputModePicker.options.length) return;
-      const selectedMode = outputModePicker.options[selectedIdx] as OutputMode;
-      const changed = setChatOutputMode(config, outputModePicker.chatId, selectedMode);
-      if (changed) {
-        saveConfig(config).catch(() => {});
+      const selected = outputModePicker.options[selectedIdx] as PendingOutputModeOption;
+      const chatId = outputModePicker.chatId;
+
+      if (selected.kind === "preset") {
+        if (selected.value !== "custom") {
+          const changed = applyChatTranscriptPreset(config, chatId, selected.value);
+          if (changed) saveConfig(config).catch(() => {});
+          const pickerFmt = getFormatterForChat(chatId);
+          closePollForChat(chatId, outputModePicker.messageId, buildOutputModeSummaryMessage(chatId, config, pickerFmt));
+          return;
+        }
+
+        const current = getChatOutputPreferences(config, chatId);
+        closePollForChat(chatId, outputModePicker.messageId, `${getFormatterForChat(chatId).escape("⛳️")} ${getFormatterForChat(chatId).escape("Custom output setup started.")}`);
+        const next = buildOutputPickerPrompt("thinkingMode", current);
+        sendPollToChat(chatId, next.title, next.optionLabels, false)
+          .then((sent) => {
+            if (!sent) return;
+            sessionManager.registerOutputModePicker({
+              pollId: sent.pollId,
+              messageId: sent.messageId,
+              chatId,
+              ownerUserId: outputModePicker.ownerUserId,
+              step: "thinkingMode",
+              options: next.options,
+              pendingOutput: current,
+            });
+          })
+          .catch(() => {});
+        return;
       }
-      const selectedModeLabel = selectedMode === "compact" ? "simple" : selectedMode;
-      const pickerFmt = getFormatterForChat(outputModePicker.chatId);
-      closePollForChat(
-        outputModePicker.chatId,
-        outputModePicker.messageId,
-        `${pickerFmt.escape("⛳️")} Output mode set to ${pickerFmt.bold(pickerFmt.escape(selectedModeLabel))}`
-      );
+
+      const current = outputModePicker.pendingOutput || getChatOutputPreferences(config, chatId);
+      const nextOutput = { ...current, [selected.kind]: selected.value };
+      const nextStep = getNextOutputWizardStep(selected.kind);
+      if (!nextStep) {
+        const changed = setChatOutputPreferences(config, chatId, nextOutput);
+        if (changed) saveConfig(config).catch(() => {});
+        const pickerFmt = getFormatterForChat(chatId);
+        closePollForChat(chatId, outputModePicker.messageId, buildOutputModeSummaryMessage(chatId, config, pickerFmt));
+        return;
+      }
+
+      closePollForChat(chatId, outputModePicker.messageId);
+      const next = buildOutputPickerPrompt(nextStep, nextOutput);
+      sendPollToChat(chatId, next.title, next.optionLabels, false)
+        .then((sent) => {
+          if (!sent) return;
+          sessionManager.registerOutputModePicker({
+            pollId: sent.pollId,
+            messageId: sent.messageId,
+            chatId,
+            ownerUserId: outputModePicker.ownerUserId,
+            step: nextStep,
+            options: next.options,
+            pendingOutput: nextOutput,
+          });
+        })
+        .catch(() => {});
       return;
     }
 
@@ -2118,12 +2186,17 @@ export async function startDaemon(): Promise<void> {
       if (fileStats.size <= 0) return { ok: false, error: "File is empty" };
       if (fileStats.size > 50 * 1024 * 1024) return { ok: false, error: "File exceeds 50MB channel upload limit" };
 
-      // Security: restrict file sends to session cwd and uploads directory
+      // Security: restrict file sends to session cwd, uploads directory, and OMP session artifact dir
       // Use realpath to resolve symlinks and prevent traversal
       try {
         const realFile = await realpath(filePath);
         const allowedRoots: string[] = [paths.uploadsDir];
         if (remote.cwd) allowedRoots.push(await realpath(remote.cwd).catch(() => remote.cwd));
+        const manifestJsonl = readSessionManifestSync(sessionId)?.jsonlFile;
+        if (manifestJsonl) {
+          const sessionArtifactRoot = await realpath(resolve(dirname(manifestJsonl), "local")).catch(() => resolve(dirname(manifestJsonl), "local"));
+          allowedRoots.push(sessionArtifactRoot);
+        }
         const inAllowed = allowedRoots.some((root) => realFile.startsWith(root + "/") || realFile === root);
         if (!inAllowed) {
           return { ok: false, error: `File path outside session working directory: ${filePath}` };
@@ -2201,13 +2274,13 @@ export async function startDaemon(): Promise<void> {
 
       for (const cid of targets) {
         if (isChatMutedForChat(cid)) continue;
-        const outputMode = getOutputModeForChat(cid);
+        const output = getOutputPreferencesForChat(cid);
+        if (output.toolCallMode === "off") continue;
         const fmt = getFormatterForChat(cid);
-        const detailMode = outputMode === "verbose" ? "verbose" : "simple";
+        const detailMode = output.toolCallMode === "detailed" ? "verbose" : "simple";
         const html = formatToolCall(fmt, name, input, detailMode, remote.cwd);
         if (!html) continue;
         sendToChat(cid, html);
-        // Re-assert typing for channels that support typing state.
         setTypingForChat(cid, true);
       }
     },
@@ -2279,14 +2352,15 @@ export async function startDaemon(): Promise<void> {
       }
       if (targets.size === 0) return;
 
-      const truncated = text.length > 1000 ? text.slice(0, 1000) + "..." : text;
       for (const cid of targets) {
         if (isChatMutedForChat(cid)) continue;
-        const outputMode = getOutputModeForChat(cid);
-        if (outputMode !== "thinking") continue;
+        const output = getOutputPreferencesForChat(cid);
+        if (output.thinkingMode === "off") continue;
         const fmt = getFormatterForChat(cid);
-        const compact = truncated.length > 220 ? `${truncated.slice(0, 220)}...` : truncated;
-        sendToChat(cid, `${fmt.escape("💭")} ${fmt.italic(fmt.fromMarkdown(compact))}`);
+        const body = output.thinkingMode === "preview"
+          ? (text.length > 220 ? `${text.slice(0, 220)}...` : text)
+          : text;
+        sendToChat(cid, `${fmt.escape("💭")} ${fmt.italic(fmt.fromMarkdown(body))}`);
       }
     },
     handleAssistantText(sessionId: string, text: string): void {
@@ -2324,15 +2398,22 @@ export async function startDaemon(): Promise<void> {
 
       for (const cid of targets) {
         if (isChatMutedForChat(cid)) continue;
-        const outputMode = getOutputModeForChat(cid);
+        const output = getOutputPreferencesForChat(cid);
+        if (isError) {
+          if (!output.toolErrors) continue;
+        } else if (output.toolResultMode === "off") {
+          continue;
+        }
         const fmt = getFormatterForChat(cid);
-        if (outputMode === "verbose") {
+        if (!isError && output.toolResultMode === "full") {
           const maxLen = 1500;
           const truncated = content.length > maxLen ? content.slice(0, maxLen) + "\n..." : content;
-          const label = isError
-            ? `${toolName || "Tool"} error`
-            : ((toolName === "Bash" || toolName === "bash" || toolName === "exec_command") ? "Output" : `${toolName} result`);
+          const label = (toolName === "Bash" || toolName === "bash" || toolName === "exec_command") ? "Output" : `${toolName} result`;
           sendToChat(cid, `${fmt.bold(fmt.escape(label))}\n${fmt.pre(fmt.escape(truncated))}`);
+        } else if (isError && output.toolResultMode === "full") {
+          const maxLen = 1500;
+          const truncated = content.length > maxLen ? content.slice(0, maxLen) + "\n..." : content;
+          sendToChat(cid, `${fmt.bold(fmt.escape(`${toolName || "Tool"} error`))}\n${fmt.pre(fmt.escape(truncated))}`);
         } else {
           const summary = formatSimpleToolResult(fmt, toolName, content, isError);
           if (!summary) continue;

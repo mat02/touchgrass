@@ -85,7 +85,7 @@ const TELEGRAM_COMMANDS = {
   session: { command: "session", description: "Show current session" },
   name: { command: "name", description: "Rename current session" },
   changeSession: { command: "change_session", description: "Switch session" },
-  outputMode: { command: "output_mode", description: "Set output mode" },
+  outputMode: { command: "output_mode", description: "Configure output" },
   skills: { command: "skills", description: "List agent skills" },
   startRemoteControl: { command: "start_remote_control", description: "Connect a session" },
   stopRemoteControl: { command: "stop_remote_control", description: "Disconnect this chat" },

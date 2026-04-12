@@ -13,7 +13,7 @@ ${fmt.bold("Commands:")}
 /stop_remote_control ${fmt.escape("—")} Disconnect session from this chat
 /session ${fmt.escape("—")} Show current session info
 /name ${fmt.escape("—")} Set or clear the current session name
-/output_mode ${fmt.escape("—")} Set output style (simple/thinking/verbose)
+/output_mode ${fmt.escape("—")} Configure Telegram output delivery
 /link ${fmt.escape("—")} Add this chat as a channel
 /pair ${fmt.escape("—")} Pair with a pairing code`;
 }

@@ -472,8 +472,14 @@ interface BackgroundJobEventInfo {
   urls?: string[];
 }
 
+interface AssistantArtifactInfo {
+  path: string;
+  caption?: string;
+}
+
 interface ParsedMessage {
   assistantText: string | null;
+  assistantArtifact: AssistantArtifactInfo | null;
   thinking: string | null;
   questions: unknown[] | null;
   toolCalls: ToolCallInfo[];
@@ -485,6 +491,8 @@ interface ParsedMessage {
 const toolUseIdToName = new Map<string, string>();
 const toolUseIdToInput = new Map<string, Record<string, unknown>>();
 const codexSessionIdToCommand = new Map<string, string>();
+
+const OMP_INLINE_PLAN_REVIEW_MAX_CHARS = 3500;
 
 // Only forward results for tools where the output is useful to see on Telegram
 const FORWARD_RESULT_TOOLS = new Set([
@@ -501,7 +509,7 @@ const isToolRejection = (text: string) =>
   text.includes("The user doesn't want to proceed with this tool use");
 
 const EMPTY_PARSED: ParsedMessage = {
-  assistantText: null, thinking: null, questions: null, toolCalls: [], toolResults: [], backgroundJobEvents: [],
+  assistantText: null, assistantArtifact: null, thinking: null, questions: null, toolCalls: [], toolResults: [], backgroundJobEvents: [],
 };
 
 function extractTaskNotificationTag(content: string, tag: string): string | undefined {
@@ -670,21 +678,30 @@ function formatOmpModeChange(mode: string, data: Record<string, unknown> | null)
   return null;
 }
 
-function readOmpLocalArtifact(sourceFilePath: string, localUri: string): string | null {
+function resolveOmpLocalArtifactPath(sourceFilePath: string, localUri: string): string | null {
   const match = localUri.match(/^local:\/\/(.+)$/);
   if (!match) return null;
   const sessionDir = sourceFilePath.endsWith(".jsonl")
     ? sourceFilePath.slice(0, -".jsonl".length)
     : dirname(sourceFilePath);
+  return join(sessionDir, "local", match[1]!);
+}
+
+function readOmpLocalArtifact(sourceFilePath: string, localUri: string): string | null {
+  const artifactPath = resolveOmpLocalArtifactPath(sourceFilePath, localUri);
+  if (!artifactPath) return null;
   try {
-    const text = readFileSync(join(sessionDir, "local", match[1]!), "utf-8").trim();
+    const text = readFileSync(artifactPath, "utf-8").trim();
     return text || null;
   } catch {
     return null;
   }
 }
 
-function buildOmpPlanReviewText(details: Record<string, unknown> | null, sourceFilePath?: string): string | null {
+function buildOmpPlanReviewOutcome(
+  details: Record<string, unknown> | null,
+  sourceFilePath?: string
+): { text: string; artifactPath?: string } | null {
   const title = typeof details?.title === "string" ? details.title.trim() : "";
   const artifactUri = typeof details?.finalPlanFilePath === "string"
     ? details.finalPlanFilePath
@@ -694,10 +711,13 @@ function buildOmpPlanReviewText(details: Record<string, unknown> | null, sourceF
   const header = title
     ? `⛳ Plan ready for approval: ${title}`
     : "⛳ Plan ready for approval.";
-  if (!sourceFilePath) return `${header}\n\nReview artifact: ${artifactUri}`;
+  if (!sourceFilePath) return { text: `${header}\n\nReview artifact: ${artifactUri}` };
   const planText = readOmpLocalArtifact(sourceFilePath, artifactUri);
-  if (!planText) return `${header}\n\nReview artifact: ${artifactUri}`;
-  return `${header}\n\n${planText}`;
+  if (!planText) return { text: `${header}\n\nReview artifact: ${artifactUri}` };
+  if (planText.length <= OMP_INLINE_PLAN_REVIEW_MAX_CHARS) return { text: `${header}\n\n${planText}` };
+  const artifactPath = resolveOmpLocalArtifactPath(sourceFilePath, artifactUri) || undefined;
+  if (artifactPath) return { text: header, artifactPath };
+  return { text: `${header}\n\n${planText}` };
 }
 
 const kimiAssistantTextBuffer: string[] = [];
@@ -779,7 +799,7 @@ function parseJsonlMessage(msg: Record<string, unknown>, sourceFilePath?: string
     capIdMap();
     const assistantText = texts.join("\n").trim() || null;
     const thinking = thinkings.join("\n").trim() || null;
-    return { assistantText, thinking, questions, toolCalls, toolResults: [], backgroundJobEvents: [] };
+    return { assistantText, assistantArtifact: null, thinking, questions, toolCalls, toolResults: [], backgroundJobEvents: [] };
   }
 
   // Kimi wire.jsonl format — {"timestamp": ..., "message": {"type": "...", "payload": {...}}}
@@ -794,7 +814,7 @@ function parseJsonlMessage(msg: Record<string, unknown>, sourceFilePath?: string
       kimiAssistantTextBuffer.length = 0;
       kimiAssistantThinkingBuffer.length = 0;
       if (!assistantText && !thinking) return EMPTY_PARSED;
-      return { assistantText, thinking, questions: null, toolCalls: [], toolResults: [], backgroundJobEvents: [] };
+      return { assistantText, assistantArtifact: null, thinking, questions: null, toolCalls: [], toolResults: [], backgroundJobEvents: [] };
     }
 
     const payloadPartType = typeof wirePayload.type === "string" ? wirePayload.type : "";
@@ -927,7 +947,7 @@ function parseJsonlMessage(msg: Record<string, unknown>, sourceFilePath?: string
       capIdMap();
       const assistantText = texts.join("\n").trim() || null;
       const thinking = thinkings.join("\n").trim() || null;
-      return { assistantText, thinking, questions, toolCalls, toolResults: [], backgroundJobEvents: [] };
+      return { assistantText, assistantArtifact: null, thinking, questions, toolCalls, toolResults: [], backgroundJobEvents: [] };
     }
 
     if (m.role === "toolResult") {
@@ -942,9 +962,11 @@ function parseJsonlMessage(msg: Record<string, unknown>, sourceFilePath?: string
       if (isError && isToolRejection(text)) return EMPTY_PARSED;
       if (!text) return EMPTY_PARSED;
       if (!isError && toolName === "exit_plan_mode") {
+        const planReview = buildOmpPlanReviewOutcome(asRecord(m.details), sourceFilePath);
         return {
           ...EMPTY_PARSED,
-          assistantText: buildOmpPlanReviewText(asRecord(m.details), sourceFilePath) || text,
+          assistantText: planReview?.text || text,
+          assistantArtifact: planReview?.artifactPath ? { path: planReview.artifactPath, caption: "Plan review artifact" } : null,
         };
       }
       if (!isError && !FORWARD_RESULT_TOOLS.has(toolName)) return EMPTY_PARSED;
@@ -1226,6 +1248,7 @@ function encodeBracketedPaste(text: string): Buffer {
 function watchSessionFile(
   filePath: string,
   onAssistant: (text: string) => void,
+  onAssistantFile?: (artifact: AssistantArtifactInfo) => void,
   onQuestion?: (questions: unknown[]) => void,
   onToolCall?: (calls: ToolCallInfo[]) => void,
   onThinking?: (text: string) => void,
@@ -1304,6 +1327,7 @@ function watchSessionFile(
             if (onMessageParsed) onMessageParsed(msg);
             const parsed = parseJsonlMessage(msg, filePath);
             if (parsed.assistantText) onAssistant(parsed.assistantText);
+            if (onAssistantFile && parsed.assistantArtifact) onAssistantFile(parsed.assistantArtifact);
             if (onQuestion && parsed.questions) onQuestion(parsed.questions);
             if (onToolCall && parsed.toolCalls.length > 0) onToolCall(parsed.toolCalls);
             if (onToolResult && parsed.toolResults.length > 0) onToolResult(parsed.toolResults);
@@ -2446,7 +2470,6 @@ export async function runRun(): Promise<void> {
               }
             }
           : undefined;
-
         const onAssistant = (text: string) => {
           // Reset so we can catch the same prompt again if the tool asks it multiple times
           lastNotifiedPrompt = "";
@@ -2465,6 +2488,14 @@ export async function runRun(): Promise<void> {
             tgChannel.send(cid, formatted).catch(() => {});
           }
         };
+        const onAssistantFile = tgRemoteId
+          ? (artifact: AssistantArtifactInfo) => {
+              daemonRequest(`/remote/${tgRemoteId}/send-file`, "POST", {
+                filePath: artifact.path,
+                caption: artifact.caption,
+              }).catch(() => {});
+            }
+          : undefined;
 
         if (cmdName === "gemini") {
           watcherRef.current = watchGeminiSessionFile(sessionFile, onAssistant, skipExisting);
@@ -2472,6 +2503,7 @@ export async function runRun(): Promise<void> {
           watcherRef.current = watchSessionFile(
             sessionFile,
             onAssistant,
+            onAssistantFile,
             onQuestion,
             onToolCall,
             onThinking,

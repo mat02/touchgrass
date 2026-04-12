@@ -1,7 +1,14 @@
 import { randomBytes } from "crypto";
 import type { ChannelChatId, ChannelUserId } from "../channel/types";
 import type { SessionInfo } from "./types";
-import type { OutputMode, TgSettings } from "../config/schema";
+import type {
+  ChatOutputPreferences,
+  TgSettings,
+  ThinkingMode,
+  ToolCallMode,
+  ToolResultMode,
+  TranscriptOutputPreset,
+} from "../config/schema";
 import { mergeRemoteControlAction, type RemoteControlAction } from "./remote-control";
 
 export interface RemoteSession {
@@ -85,14 +92,24 @@ export interface PendingResumePicker {
   options: PendingResumePickerOption[];
 }
 
+export type PendingOutputModeOption =
+  | { kind: "preset"; value: TranscriptOutputPreset | "custom" }
+  | { kind: "thinkingMode"; value: ThinkingMode }
+  | { kind: "toolCallMode"; value: ToolCallMode }
+  | { kind: "toolResultMode"; value: ToolResultMode }
+  | { kind: "toolErrors"; value: boolean }
+  | { kind: "backgroundJobs"; value: boolean }
+  | { kind: "typingIndicator"; value: boolean };
+
 export interface PendingOutputModePicker {
   pollId: string;
   messageId: string;
   chatId: ChannelChatId;
   ownerUserId: ChannelUserId;
-  options: OutputMode[];
+  step: "preset" | "thinkingMode" | "toolCallMode" | "toolResultMode" | "toolErrors" | "backgroundJobs" | "typingIndicator";
+  options: PendingOutputModeOption[];
+  pendingOutput?: ChatOutputPreferences;
 }
-
 export interface PendingRecentMessagesPoll {
   sessionId: string;
   chatId: ChannelChatId;

@@ -17,7 +17,32 @@ const SIMPLE_SUPPRESSED_TOOL_CALLS = new Set([
   "write_stdin",
   "read_stdin",
 ]);
+const SUPPRESSED_TOOL_CALLS = new Set(["exit_plan_mode"]);
 
+function extractFallbackToolDetail(input: Record<string, unknown>, cwd?: string): string | undefined {
+  const filePath = getFirstString(input, ["file_path", "path"]);
+  if (filePath) return relativePath(filePath, cwd);
+  const pattern = getFirstString(input, ["pattern"]);
+  if (pattern) return pattern;
+  const query = getFirstString(input, ["query"]);
+  if (query) return query;
+  const url = getFirstString(input, ["url"]);
+  if (url) return url;
+  const command = getFirstString(input, ["command", "cmd"]);
+  if (command) return command;
+  const title = getFirstString(input, ["title", "description", "message"]);
+  if (title) return title;
+  return getFirstString(input, ["id", "taskId", "task_id"]);
+}
+
+function formatTodoWriteToolCall(fmt: Formatter, input: Record<string, unknown>): string {
+  const ops = Array.isArray(input.ops) ? input.ops.filter((op): op is Record<string, unknown> => !!op && typeof op === "object") : [];
+  const firstOp = ops[0];
+  const action = getFirstString(firstOp || {}, ["op"]) || "update";
+  const id = getFirstString(firstOp || {}, ["id", "phase", "name"]);
+  const countLabel = ops.length > 1 ? `${ops.length} ops` : (id ? `${action} ${id}` : action);
+  return `${fmt.escape("🧩")} ${fmt.code(fmt.escape("todo_write"))} ${fmt.escape("•")} ${fmt.escape(countLabel)}`;
+}
 function relativePath(fp: string, cwd?: string): string {
   if (!cwd) return fp;
   const prefix = cwd.endsWith("/") ? cwd : `${cwd}/`;
@@ -214,6 +239,7 @@ export function formatToolCall(
   mode: ToolDisplayMode,
   cwd?: string
 ): string | null {
+  if (SUPPRESSED_TOOL_CALLS.has(name)) return null;
   if (mode === "simple" && SIMPLE_SUPPRESSED_TOOL_CALLS.has(name)) return null;
 
   switch (name) {
@@ -227,25 +253,20 @@ export function formatToolCall(
       if (oldStr || newStr) {
         const diffLines: string[] = [];
         if (oldStr) {
-          for (const line of oldStr.split("\n").slice(0, 5)) {
-            diffLines.push(`- ${line}`);
-          }
+          for (const line of oldStr.split("\n").slice(0, 5)) diffLines.push(`- ${line}`);
           if (oldStr.split("\n").length > 5) diffLines.push("- ...");
         }
         if (newStr) {
-          for (const line of newStr.split("\n").slice(0, 5)) {
-            diffLines.push(`+ ${line}`);
-          }
+          for (const line of newStr.split("\n").slice(0, 5)) diffLines.push(`+ ${line}`);
           if (newStr.split("\n").length > 5) diffLines.push("+ ...");
         }
-        if (diffLines.length > 0) {
-          msg += `\n${fmt.pre(fmt.escape(diffLines.join("\n")))}`;
-        }
+        if (diffLines.length > 0) msg += `\n${fmt.pre(fmt.escape(diffLines.join("\n")))}`;
       }
       return msg;
     }
-    case "Write": {
-      const fp = input.file_path as string | undefined;
+    case "Write":
+    case "write": {
+      const fp = (input.file_path as string | undefined) || (input.path as string | undefined);
       if (!fp) return null;
       let msg = `${fmt.escape("📄")} ${fmt.code(fmt.escape(relativePath(fp, cwd)))}`;
       if (mode === "simple") return msg;
@@ -266,9 +287,7 @@ export function formatToolCall(
       return `$ ${fmt.code(fmt.escape(truncated))}`;
     }
     case "exec_command": {
-      let cmd = "";
-      if (typeof input.cmd === "string") cmd = input.cmd;
-      else if (typeof input.command === "string") cmd = input.command;
+      const cmd = typeof input.cmd === "string" ? input.cmd : typeof input.command === "string" ? input.command : "";
       if (!cmd) return null;
       const truncated = truncateText(cmd, mode === "simple" ? 120 : 200);
       return `$ ${fmt.code(fmt.escape(truncated))}`;
@@ -287,19 +306,24 @@ export function formatToolCall(
     case "write_stdin":
       if (mode === "simple") return null;
       return `${fmt.escape("⌨️")} ${fmt.code("write_stdin")}`;
-    case "Read": {
-      const fp = input.file_path as string | undefined;
+    case "Read":
+    case "read": {
+      const fp = (input.file_path as string | undefined) || (input.path as string | undefined);
       if (!fp) return null;
       return `${fmt.escape("📖")} ${fmt.code(fmt.escape(relativePath(fp, cwd)))}`;
     }
-    case "Glob": {
+    case "Glob":
+    case "glob":
+    case "Find":
+    case "find": {
       const pattern = input.pattern as string | undefined;
       if (!pattern) return null;
       const path = input.path as string | undefined;
       const inPart = path ? ` in ${fmt.code(fmt.escape(relativePath(path, cwd)))}` : "";
       return `${fmt.escape("🔍")} ${fmt.code(fmt.escape(pattern))}${inPart}`;
     }
-    case "Grep": {
+    case "Grep":
+    case "grep": {
       const pattern = input.pattern as string | undefined;
       if (!pattern) return null;
       const glob = input.glob as string | undefined;
@@ -313,25 +337,22 @@ export function formatToolCall(
       const desc = input.description as string | undefined;
       if (!desc) return null;
       const prompt = input.prompt as string | undefined;
-      // Show first line of prompt only, truncated
       const firstPromptLine = prompt?.split("\n")[0];
       const promptLine = firstPromptLine
         ? `\n${fmt.escape("↳")} ${fmt.escape(truncateText(firstPromptLine, mode === "simple" ? 100 : 200))}`
         : "";
-      if (mode === "simple") {
-        return `${fmt.escape("🤖")} ${fmt.italic(fmt.escape(truncateText(desc, 140)))}${promptLine}`;
-      }
+      if (mode === "simple") return `${fmt.escape("🤖")} ${fmt.italic(fmt.escape(truncateText(desc, 140)))}${promptLine}`;
       return `${fmt.escape("🤖")} ${fmt.italic(fmt.escape(desc))}${promptLine}`;
     }
+    case "todo_write":
+      return formatTodoWriteToolCall(fmt, input);
     case "spawn_agent": {
       const agentType = getFirstString(input, ["agent_type", "type"]);
       const message = getFirstString(input, ["message", "prompt", "description"]);
       const parts = [`${fmt.escape("🤖")} ${fmt.code(fmt.escape("spawn_agent"))}`];
       if (agentType) parts.push(`${fmt.escape("•")} ${fmt.escape(agentType)}`);
       let line = parts.join(" ");
-      if (message) {
-        line += `\n${fmt.escape("↳")} ${fmt.italic(fmt.escape(truncateText(message, mode === "simple" ? 140 : 220)))}`;
-      }
+      if (message) line += `\n${fmt.escape("↳")} ${fmt.italic(fmt.escape(truncateText(message, mode === "simple" ? 140 : 220)))}`;
       return line;
     }
     case "send_input": {
@@ -341,19 +362,13 @@ export function formatToolCall(
       if (receiver) parts.push(`${fmt.escape("•")} ${fmt.code(fmt.escape(receiver))}`);
       if (input.interrupt === true) parts.push(`${fmt.escape("•")} ${fmt.escape("interrupt")}`);
       let line = parts.join(" ");
-      if (message) {
-        line += `\n${fmt.escape("↳")} ${fmt.escape(truncateText(message, mode === "simple" ? 140 : 220))}`;
-      }
+      if (message) line += `\n${fmt.escape("↳")} ${fmt.escape(truncateText(message, mode === "simple" ? 140 : 220))}`;
       return line;
     }
     case "wait": {
-      const ids = Array.isArray(input.ids)
-        ? input.ids.filter((id): id is string => typeof id === "string" && id.trim().length > 0)
-        : [];
+      const ids = Array.isArray(input.ids) ? input.ids.filter((id): id is string => typeof id === "string" && id.trim().length > 0) : [];
       const timeoutValue = input.timeout_ms ?? input.timeout;
-      const timeoutLabel = typeof timeoutValue === "number"
-        ? `${timeoutValue}ms`
-        : (typeof timeoutValue === "string" && timeoutValue.trim() ? timeoutValue.trim() : undefined);
+      const timeoutLabel = typeof timeoutValue === "number" ? `${timeoutValue}ms` : (typeof timeoutValue === "string" && timeoutValue.trim() ? timeoutValue.trim() : undefined);
       const parts = [`${fmt.escape("⏳")} ${fmt.code(fmt.escape("wait"))}`];
       if (ids.length > 0) parts.push(`${fmt.escape("•")} ${fmt.escape(`${ids.length} agent${ids.length === 1 ? "" : "s"}`)}`);
       if (timeoutLabel) parts.push(`${fmt.escape("•")} ${fmt.code(fmt.escape(timeoutLabel))}`);
@@ -381,10 +396,9 @@ export function formatToolCall(
       return `${fmt.escape("🌐")} ${fmt.code(fmt.escape(truncateText(url, mode === "simple" ? 100 : 180)))}`;
     }
     default:
-      if (name.startsWith("Task")) {
-        return formatTaskToolCall(fmt, name, input, mode);
-      }
-      if (mode === "simple") return `${fmt.escape("🔧")} ${fmt.code(fmt.escape(name))}`;
+      if (name.startsWith("Task")) return formatTaskToolCall(fmt, name, input, mode);
+      const detail = extractFallbackToolDetail(input, cwd);
+      if (detail) return `${fmt.escape("🔧")} ${fmt.code(fmt.escape(name))} ${fmt.escape("•")} ${fmt.escape(truncateText(detail, mode === "simple" ? 120 : 220))}`;
       return `${fmt.escape("🔧")} ${fmt.code(fmt.escape(name))}`;
   }
 }

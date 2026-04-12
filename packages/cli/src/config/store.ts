@@ -1,6 +1,14 @@
 import { readFile, writeFile, chmod } from "fs/promises";
 import { paths, ensureDirs } from "./paths";
-import { type TgConfig, type ChannelConfig, createDefaultConfig, validateConfig, defaultSettings } from "./schema";
+import {
+  type TgConfig,
+  type ChannelConfig,
+  createDefaultConfig,
+  validateConfig,
+  defaultSettings,
+  setChatOutputPreferences,
+  getChatOutputPreferences,
+} from "./schema";
 
 let cached: TgConfig | null = null;
 
@@ -74,28 +82,80 @@ export async function loadConfig(): Promise<TgConfig> {
           delete parsed.chatPreferences[chatId];
           continue;
         }
-        const rawPref = pref as { outputMode?: unknown; thinking?: unknown; muted?: unknown };
-        if (rawPref.thinking === true) {
-          rawPref.outputMode = "thinking";
-        }
-        delete rawPref.thinking;
-        const mode = rawPref.outputMode;
-        const muted = (pref as { muted?: unknown }).muted;
-        const validMode = mode === undefined || mode === "verbose" || mode === "compact" || mode === "thinking";
-        const validMuted = muted === undefined || typeof muted === "boolean";
-        if (!validMode || !validMuted) {
+        const rawPref = pref as {
+          outputMode?: unknown;
+          thinking?: unknown;
+          muted?: unknown;
+          output?: {
+            thinkingMode?: unknown;
+            toolCallMode?: unknown;
+            toolResultMode?: unknown;
+            toolErrors?: unknown;
+            backgroundJobs?: unknown;
+            typingIndicator?: unknown;
+          } | unknown;
+        };
+        const muted = rawPref.muted;
+        if (muted !== undefined && typeof muted !== "boolean") {
           delete parsed.chatPreferences[chatId];
           continue;
         }
-        // Compact is the default and should not be persisted explicitly.
-        if (mode === "compact") {
-          delete (pref as { outputMode?: unknown }).outputMode;
+
+        const hasNewOutput = rawPref.output && typeof rawPref.output === "object";
+        if (hasNewOutput) {
+          const output = rawPref.output as Record<string, unknown>;
+          const valid =
+            (output.thinkingMode === undefined || output.thinkingMode === "off" || output.thinkingMode === "preview" || output.thinkingMode === "full") &&
+            (output.toolCallMode === undefined || output.toolCallMode === "off" || output.toolCallMode === "compact" || output.toolCallMode === "detailed") &&
+            (output.toolResultMode === undefined || output.toolResultMode === "off" || output.toolResultMode === "compact" || output.toolResultMode === "full") &&
+            (output.toolErrors === undefined || typeof output.toolErrors === "boolean") &&
+            (output.backgroundJobs === undefined || typeof output.backgroundJobs === "boolean") &&
+            (output.typingIndicator === undefined || typeof output.typingIndicator === "boolean");
+          if (!valid) {
+            delete parsed.chatPreferences[chatId];
+            continue;
+          }
+        } else {
+          let migrated = getChatOutputPreferences(parsed as TgConfig, chatId);
+          let shouldMigrateLegacy = false;
+          if (rawPref.thinking === true) {
+            migrated = {
+              ...migrated,
+              thinkingMode: "full",
+            };
+            shouldMigrateLegacy = true;
+          }
+          const mode = rawPref.outputMode;
+          if (mode === "compact") {
+            migrated = getChatOutputPreferences(parsed as TgConfig, chatId);
+            shouldMigrateLegacy = true;
+          } else if (mode === "thinking") {
+            migrated = {
+              ...migrated,
+              thinkingMode: "full",
+            };
+            shouldMigrateLegacy = true;
+          } else if (mode === "verbose") {
+            migrated = {
+              ...migrated,
+              thinkingMode: "full",
+              toolCallMode: "detailed",
+              toolResultMode: "full",
+              toolErrors: true,
+            };
+            shouldMigrateLegacy = true;
+          } else if (mode !== undefined) {
+            delete parsed.chatPreferences[chatId];
+            continue;
+          }
+          delete rawPref.thinking;
+          delete rawPref.outputMode;
+          if (shouldMigrateLegacy) {
+            setChatOutputPreferences(parsed as TgConfig, chatId, migrated);
+          }
         }
-        // Keep only meaningful preference objects.
-        if (
-          (pref as { outputMode?: unknown }).outputMode === undefined &&
-          (pref as { muted?: unknown }).muted !== true
-        ) {
+
+        if (parsed.chatPreferences[chatId] && parsed.chatPreferences[chatId].muted !== true && parsed.chatPreferences[chatId].output === undefined) {
           delete parsed.chatPreferences[chatId];
         }
       }

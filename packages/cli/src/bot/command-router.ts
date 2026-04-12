@@ -265,7 +265,7 @@ export async function routeMessage(
     return;
   }
 
-  // /output_mode [simple|thinking|verbose] — choose how noisy bridge output should be
+  // /output_mode [preset|setting value] — configure Telegram output delivery
   if (text === "/output_mode" || text === "/output-mode" || text.startsWith("/output_mode ") || text.startsWith("/output-mode ")) {
     const modeArg = text.replace(/^\/output(?:_|-)mode/i, "").trim() || undefined;
     await handleOutputModeCommand({ ...msg, text }, modeArg, ctx);
@@ -393,7 +393,7 @@ export async function routeMessage(
 
     await ctx.channel.send(
       chatId,
-      `Unknown command. Use ${fmt.code("touchgrass session")}, ${fmt.code("touchgrass name <value>")}, ${fmt.code("touchgrass resume")}, ${fmt.code("touchgrass output_mode simple|thinking|verbose")}, ${fmt.code("touchgrass attach <id>")}, ${fmt.code("touchgrass detach")}, ${fmt.code("touchgrass stop <id>")}, ${fmt.code("touchgrass kill <id>")}, or ${fmt.code("touchgrass restart [session_id]")}. Start sessions from your terminal with ${fmt.code("touchgrass claude")}, ${fmt.code("touchgrass codex")}, ${fmt.code("touchgrass pi")}, ${fmt.code("touchgrass omp")}, ${fmt.code("touchgrass kimi")}, or ${fmt.code("touchgrass gemini")}.`
+      `Unknown command. Use ${fmt.code("touchgrass session")}, ${fmt.code("touchgrass name <value>")}, ${fmt.code("touchgrass resume")}, ${fmt.code("touchgrass output_mode")}, ${fmt.code("touchgrass output_mode simple")}, ${fmt.code("touchgrass output_mode tool_calls off")}, ${fmt.code("touchgrass attach <id>")}, ${fmt.code("touchgrass detach")}, ${fmt.code("touchgrass stop <id>")}, ${fmt.code("touchgrass kill <id>")}, or ${fmt.code("touchgrass restart [session_id]")}. Start sessions from your terminal with ${fmt.code("touchgrass claude")}, ${fmt.code("touchgrass codex")}, ${fmt.code("touchgrass pi")}, ${fmt.code("touchgrass omp")}, ${fmt.code("touchgrass kimi")}, or ${fmt.code("touchgrass gemini")}.`
     );
     return;
   }

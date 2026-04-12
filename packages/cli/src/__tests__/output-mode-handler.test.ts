@@ -44,7 +44,7 @@ function createCtx(sent: string[], withPoll = false) {
 }
 
 describe("output mode command", () => {
-  it("shows current output mode when called without args (text fallback)", async () => {
+  it("shows current output settings when called without args (text fallback)", async () => {
     const sent: string[] = [];
     const ctx = createCtx(sent);
 
@@ -53,12 +53,13 @@ describe("output mode command", () => {
       ctx
     );
 
-    expect(sent).toHaveLength(1);
-    expect(sent[0]).toContain("simple");
-    expect(sent[0]).toContain("Usage: /output_mode simple|thinking|verbose");
+    expect(sent).toHaveLength(2);
+    expect(sent[0]).toContain("Transcript preset: simple");
+    expect(sent[0]).toContain("Thinking: preview");
+    expect(sent[1]).toContain("/output_mode tool_calls off|compact|detailed");
   });
 
-  it("opens picker buttons when /output_mode has no args and polling is supported", async () => {
+  it("opens preset picker when /output_mode has no args and polling is supported", async () => {
     const sent: string[] = [];
     const ctx = createCtx(sent, true);
 
@@ -67,10 +68,17 @@ describe("output mode command", () => {
       ctx
     );
 
-    expect(sent).toHaveLength(0);
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toContain("Transcript preset: simple");
     const picker = ctx.sessionManager.getOutputModePickerByPollId("poll-output-mode");
     expect(picker).toBeDefined();
-    expect(picker.options).toEqual(["compact", "thinking", "verbose"]);
+    expect(picker.step).toBe("preset");
+    expect(picker.options).toEqual([
+      { kind: "preset", value: "simple" },
+      { kind: "preset", value: "thinking" },
+      { kind: "preset", value: "verbose" },
+      { kind: "preset", value: "custom" },
+    ]);
   });
 
   it("accepts tg output-mode alias", async () => {
@@ -82,8 +90,8 @@ describe("output mode command", () => {
       ctx
     );
 
-    expect(sent).toHaveLength(1);
-    expect(sent[0]).toContain("Output mode for this chat");
+    expect(sent).toHaveLength(2);
+    expect(sent[0]).toContain("Output settings");
   });
 
   it("rejects invalid output mode values", async () => {
@@ -96,11 +104,11 @@ describe("output mode command", () => {
     );
 
     expect(sent).toHaveLength(1);
-    expect(sent[0]).toContain("Usage: /output_mode simple|thinking|verbose");
-    expect(sent[0]).toContain("Current mode: simple");
+    expect(sent[0]).toContain("/output_mode simple|thinking|verbose");
+    expect(sent[0]).toContain("Transcript preset: simple");
   });
 
-  it("accepts simple as explicit mode alias", async () => {
+  it("accepts simple as explicit preset alias", async () => {
     const sent: string[] = [];
     const ctx = createCtx(sent);
 
@@ -110,10 +118,10 @@ describe("output mode command", () => {
     );
 
     expect(sent).toHaveLength(1);
-    expect(sent[0]).toContain("Output mode is now simple");
+    expect(sent[0]).toContain("Transcript preset: simple");
   });
 
-  it("accepts thinking as an explicit mode", async () => {
+  it("accepts thinking as an explicit preset", async () => {
     const sent: string[] = [];
     const ctx = createCtx(sent);
 
@@ -123,7 +131,22 @@ describe("output mode command", () => {
     );
 
     expect(sent).toHaveLength(1);
-    expect(sent[0]).toContain("Output mode is now thinking");
+    expect(sent[0]).toContain("Transcript preset: thinking");
+    expect(sent[0]).toContain("Thinking: full");
+  });
+
+  it("accepts granular tool call settings", async () => {
+    const sent: string[] = [];
+    const ctx = createCtx(sent);
+
+    await routeMessage(
+      { userId: "telegram:1", chatId: "telegram:100", text: "/output_mode tool_calls off" },
+      ctx
+    );
+
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toContain("Tool calls: off");
+    expect(sent[0]).toContain("Transcript preset: custom");
   });
 
   it("rejects removed messages_only mode", async () => {
@@ -136,8 +159,7 @@ describe("output mode command", () => {
     );
 
     expect(sent).toHaveLength(1);
-    expect(sent[0]).toContain("Usage: /output_mode simple|thinking|verbose");
-    expect(sent[0]).toContain("Current mode: simple");
+    expect(sent[0]).toContain("/output_mode simple|thinking|verbose");
+    expect(sent[0]).toContain("Transcript preset: simple");
   });
-
 });

@@ -353,11 +353,19 @@ describe("output mode picker state", () => {
       messageId: "1",
       chatId: "telegram:100" as ChannelChatId,
       ownerUserId: "telegram:100" as ChannelUserId,
-      options: ["compact", "thinking", "verbose"],
+      step: "preset",
+      options: [
+        { kind: "preset", value: "simple" },
+        { kind: "preset", value: "custom" },
+      ],
     });
 
     const picker = mgr.getOutputModePickerByPollId("output-1");
-    expect(picker?.options).toEqual(["compact", "thinking", "verbose"]);
+    expect(picker?.step).toBe("preset");
+    expect(picker?.options).toEqual([
+      { kind: "preset", value: "simple" },
+      { kind: "preset", value: "custom" },
+    ]);
     mgr.removeOutputModePicker("output-1");
     expect(mgr.getOutputModePickerByPollId("output-1")).toBeUndefined();
   });

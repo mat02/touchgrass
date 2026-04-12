@@ -5,13 +5,17 @@ import {
   removeLinkedGroup,
   isLinkedGroup,
   updateLinkedGroupTitle,
-  getChatOutputMode,
+  getChatOutputPreferences,
+  getChatTranscriptPresetLabel,
   getChatMuted,
-  setChatOutputMode,
+  setChatOutputPreferences,
+  applyChatTranscriptPreset,
   setChatMuted,
   type TgConfig,
   type ChannelConfig,
+  type ChatOutputPreferences,
   defaultSettings,
+  DEFAULT_CHAT_OUTPUT_PREFERENCES,
 } from "../config/schema";
 
 function makeChannel(type: string, groups: ChannelConfig["linkedGroups"] = []): ChannelConfig {
@@ -221,48 +225,102 @@ describe("updateLinkedGroupTitle", () => {
   });
 });
 
-describe("chat output mode", () => {
-  it("defaults to compact when no preference exists", () => {
+describe("chat output preferences", () => {
+  it("defaults to the simple transcript preset with extras on", () => {
     const config = makeConfig({ telegram: makeChannel("telegram") });
-    expect(getChatOutputMode(config, "telegram:100")).toBe("compact");
+    expect(getChatOutputPreferences(config, "telegram:100")).toEqual(DEFAULT_CHAT_OUTPUT_PREFERENCES);
+    expect(getChatTranscriptPresetLabel(config, "telegram:100")).toBe("simple");
   });
 
-  it("sets and reads thinking mode per chat", () => {
+  it("applies the thinking transcript preset without changing extras", () => {
     const config = makeConfig({ telegram: makeChannel("telegram") });
-    const changed = setChatOutputMode(config, "telegram:100", "thinking");
+    setChatOutputPreferences(config, "telegram:100", {
+      ...DEFAULT_CHAT_OUTPUT_PREFERENCES,
+      backgroundJobs: false,
+      typingIndicator: false,
+    });
+
+    const changed = applyChatTranscriptPreset(config, "telegram:100", "thinking");
     expect(changed).toBe(true);
-    expect(getChatOutputMode(config, "telegram:100")).toBe("thinking");
+    expect(getChatOutputPreferences(config, "telegram:100")).toEqual({
+      thinkingMode: "full",
+      toolCallMode: "compact",
+      toolResultMode: "compact",
+      toolErrors: true,
+      backgroundJobs: false,
+      typingIndicator: false,
+    });
+    expect(getChatTranscriptPresetLabel(config, "telegram:100")).toBe("thinking");
   });
 
-  it("sets and reads verbose mode per chat", () => {
+  it("applies the verbose transcript preset", () => {
     const config = makeConfig({ telegram: makeChannel("telegram") });
-    const changed = setChatOutputMode(config, "telegram:100", "verbose");
+    const changed = applyChatTranscriptPreset(config, "telegram:100", "verbose");
     expect(changed).toBe(true);
-    expect(getChatOutputMode(config, "telegram:100")).toBe("verbose");
+    expect(getChatOutputPreferences(config, "telegram:100")).toEqual({
+      thinkingMode: "full",
+      toolCallMode: "detailed",
+      toolResultMode: "full",
+      toolErrors: true,
+      backgroundJobs: true,
+      typingIndicator: true,
+    });
+    expect(getChatTranscriptPresetLabel(config, "telegram:100")).toBe("verbose");
   });
 
-  it("falls back to compact for unknown stored mode", () => {
+  it("reports custom transcript settings when they do not match a preset", () => {
+    const config = makeConfig({ telegram: makeChannel("telegram") });
+    setChatOutputPreferences(config, "telegram:100", {
+      ...DEFAULT_CHAT_OUTPUT_PREFERENCES,
+      toolCallMode: "off",
+    });
+    expect(getChatTranscriptPresetLabel(config, "telegram:100")).toBe("custom");
+  });
+
+  it("reads valid stored partial output preferences", () => {
     const config = makeConfig({ telegram: makeChannel("telegram") });
     config.chatPreferences = {
-      "telegram:100": { outputMode: "messages_only" as unknown as "compact" | "thinking" | "verbose" },
+      "telegram:100": {
+        output: {
+          thinkingMode: "full",
+          backgroundJobs: false,
+        },
+      },
     };
-    expect(getChatOutputMode(config, "telegram:100")).toBe("compact");
+    expect(getChatOutputPreferences(config, "telegram:100")).toEqual({
+      thinkingMode: "full",
+      toolCallMode: "compact",
+      toolResultMode: "compact",
+      toolErrors: true,
+      backgroundJobs: false,
+      typingIndicator: true,
+    });
+    expect(getChatTranscriptPresetLabel(config, "telegram:100")).toBe("thinking");
   });
 
-  it("maps legacy thinking preferences to thinking mode", () => {
+  it("falls back to defaults for invalid stored values", () => {
     const config = makeConfig({ telegram: makeChannel("telegram") });
     config.chatPreferences = {
-      "telegram:100": { thinking: true } as any,
+      "telegram:100": {
+        output: {
+          thinkingMode: "loud",
+          toolCallMode: "maybe",
+          toolErrors: "yes",
+        } as unknown as Partial<ChatOutputPreferences>,
+      },
     };
-    expect(getChatOutputMode(config, "telegram:100")).toBe("thinking");
+    expect(getChatOutputPreferences(config, "telegram:100")).toEqual(DEFAULT_CHAT_OUTPUT_PREFERENCES);
   });
 
-  it("removes explicit chat preference when resetting to compact", () => {
+  it("removes explicit chat preference when resetting to defaults", () => {
     const config = makeConfig({ telegram: makeChannel("telegram") });
-    setChatOutputMode(config, "telegram:100", "verbose");
-    const changed = setChatOutputMode(config, "telegram:100", "compact");
+    setChatOutputPreferences(config, "telegram:100", {
+      ...DEFAULT_CHAT_OUTPUT_PREFERENCES,
+      toolResultMode: "full",
+    });
+    const changed = setChatOutputPreferences(config, "telegram:100", DEFAULT_CHAT_OUTPUT_PREFERENCES);
     expect(changed).toBe(true);
-    expect(getChatOutputMode(config, "telegram:100")).toBe("compact");
+    expect(getChatOutputPreferences(config, "telegram:100")).toEqual(DEFAULT_CHAT_OUTPUT_PREFERENCES);
     expect(config.chatPreferences?.["telegram:100"]).toBeUndefined();
   });
 });
@@ -284,14 +342,17 @@ describe("chat mute preference", () => {
     expect(getChatMuted(config, "telegram:100")).toBe(false);
   });
 
-  it("keeps chat preference when unmuting if thinking is enabled", () => {
+  it("keeps chat preference when unmuting if output settings are customized", () => {
     const config = makeConfig({ telegram: makeChannel("telegram") });
     setChatMuted(config, "telegram:100", true);
-    setChatOutputMode(config, "telegram:100", "thinking");
+    setChatOutputPreferences(config, "telegram:100", {
+      ...DEFAULT_CHAT_OUTPUT_PREFERENCES,
+      typingIndicator: false,
+    });
     const changed = setChatMuted(config, "telegram:100", false);
     expect(changed).toBe(true);
     expect(getChatMuted(config, "telegram:100")).toBe(false);
-    expect(getChatOutputMode(config, "telegram:100")).toBe("thinking");
+    expect(getChatOutputPreferences(config, "telegram:100").typingIndicator).toBe(false);
     expect(config.chatPreferences?.["telegram:100"]).toBeDefined();
   });
 });

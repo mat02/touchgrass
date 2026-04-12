@@ -1,7 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import { routeMessage } from "../bot/command-router";
 import { SessionManager } from "../session/manager";
-import { defaultSettings, getChatOutputMode } from "../config/schema";
+import { defaultSettings, getChatOutputPreferences } from "../config/schema";
 
 const fmt = {
   bold: (value: string) => value,
@@ -50,7 +50,7 @@ describe("removed thinking command", () => {
       ctx
     );
 
-    expect(getChatOutputMode(ctx.config, "telegram:100")).toBe("compact");
+    expect(getChatOutputPreferences(ctx.config, "telegram:100").thinkingMode).toBe("preview");
     expect(sent[0]).toContain("command was removed");
     expect(sent[0]).toContain("/output_mode thinking");
   });
@@ -64,7 +64,7 @@ describe("removed thinking command", () => {
       ctx
     );
 
-    expect(getChatOutputMode(ctx.config, "telegram:100")).toBe("compact");
+    expect(getChatOutputPreferences(ctx.config, "telegram:100").thinkingMode).toBe("preview");
     expect(sent[0]).toContain("command was removed");
     expect(sent[0]).toContain("output_mode thinking");
   });

@@ -25,10 +25,23 @@ export interface TgConfig {
   chatPreferences?: Record<string, ChatPreferences>;
 }
 
-export type OutputMode = "compact" | "thinking" | "verbose";
+export type ThinkingMode = "off" | "preview" | "full";
+export type ToolCallMode = "off" | "compact" | "detailed";
+export type ToolResultMode = "off" | "compact" | "full";
+export type TranscriptOutputPreset = "simple" | "thinking" | "verbose";
+export type TranscriptOutputPresetLabel = TranscriptOutputPreset | "custom";
+
+export interface ChatOutputPreferences {
+  thinkingMode: ThinkingMode;
+  toolCallMode: ToolCallMode;
+  toolResultMode: ToolResultMode;
+  toolErrors: boolean;
+  backgroundJobs: boolean;
+  typingIndicator: boolean;
+}
 
 export interface ChatPreferences {
-  outputMode?: OutputMode;
+  output?: Partial<ChatOutputPreferences>;
   muted?: boolean;
 }
 
@@ -46,6 +59,36 @@ export const defaultSettings: TgSettings = {
   outputBufferMaxChars: 4096,
   maxSessions: 10,
   defaultShell: process.env.SHELL || "/bin/bash",
+};
+
+export const DEFAULT_CHAT_OUTPUT_PREFERENCES: ChatOutputPreferences = {
+  thinkingMode: "preview",
+  toolCallMode: "compact",
+  toolResultMode: "compact",
+  toolErrors: true,
+  backgroundJobs: true,
+  typingIndicator: true,
+};
+
+const TRANSCRIPT_PRESET_PREFERENCES: Record<TranscriptOutputPreset, Pick<ChatOutputPreferences, "thinkingMode" | "toolCallMode" | "toolResultMode" | "toolErrors">> = {
+  simple: {
+    thinkingMode: "preview",
+    toolCallMode: "compact",
+    toolResultMode: "compact",
+    toolErrors: true,
+  },
+  thinking: {
+    thinkingMode: "full",
+    toolCallMode: "compact",
+    toolResultMode: "compact",
+    toolErrors: true,
+  },
+  verbose: {
+    thinkingMode: "full",
+    toolCallMode: "detailed",
+    toolResultMode: "full",
+    toolErrors: true,
+  },
 };
 
 export function createDefaultConfig(): TgConfig {
@@ -68,38 +111,110 @@ export function validateConfig(config: unknown): config is TgConfig {
   );
 }
 
-export function getChatOutputMode(config: TgConfig, chatId: string): OutputMode {
-  const pref = config.chatPreferences?.[chatId] as (ChatPreferences & { thinking?: unknown }) | undefined;
-  const mode = pref?.outputMode;
-  if (mode === "verbose" || mode === "thinking") return mode;
-  if (pref?.thinking === true) return "thinking";
-  return "compact";
+function isThinkingMode(value: unknown): value is ThinkingMode {
+  return value === "off" || value === "preview" || value === "full";
 }
 
-export function getChatMuted(config: TgConfig, chatId: string): boolean {
-  return config.chatPreferences?.[chatId]?.muted === true;
+function isToolCallMode(value: unknown): value is ToolCallMode {
+  return value === "off" || value === "compact" || value === "detailed";
+}
+
+function isToolResultMode(value: unknown): value is ToolResultMode {
+  return value === "off" || value === "compact" || value === "full";
+}
+
+function transcriptMatchesPreset(
+  output: Pick<ChatOutputPreferences, "thinkingMode" | "toolCallMode" | "toolResultMode" | "toolErrors">,
+  preset: TranscriptOutputPreset
+): boolean {
+  const candidate = TRANSCRIPT_PRESET_PREFERENCES[preset];
+  return (
+    output.thinkingMode === candidate.thinkingMode &&
+    output.toolCallMode === candidate.toolCallMode &&
+    output.toolResultMode === candidate.toolResultMode &&
+    output.toolErrors === candidate.toolErrors
+  );
+}
+
+function normalizeStoredOutput(output: Partial<ChatOutputPreferences> | undefined): Partial<ChatOutputPreferences> | undefined {
+  if (!output) return undefined;
+  const normalized: Partial<ChatOutputPreferences> = {};
+  if (isThinkingMode(output.thinkingMode)) normalized.thinkingMode = output.thinkingMode;
+  if (isToolCallMode(output.toolCallMode)) normalized.toolCallMode = output.toolCallMode;
+  if (isToolResultMode(output.toolResultMode)) normalized.toolResultMode = output.toolResultMode;
+  if (typeof output.toolErrors === "boolean") normalized.toolErrors = output.toolErrors;
+  if (typeof output.backgroundJobs === "boolean") normalized.backgroundJobs = output.backgroundJobs;
+  if (typeof output.typingIndicator === "boolean") normalized.typingIndicator = output.typingIndicator;
+  return Object.keys(normalized).length > 0 ? normalized : undefined;
+}
+
+export function getChatOutputPreferences(config: TgConfig, chatId: string): ChatOutputPreferences {
+  const output = normalizeStoredOutput(config.chatPreferences?.[chatId]?.output);
+  return {
+    ...DEFAULT_CHAT_OUTPUT_PREFERENCES,
+    ...(output || {}),
+  };
+}
+
+export function getChatTranscriptPresetLabel(config: TgConfig, chatId: string): TranscriptOutputPresetLabel {
+  const current = getChatOutputPreferences(config, chatId);
+  const transcript = {
+    thinkingMode: current.thinkingMode,
+    toolCallMode: current.toolCallMode,
+    toolResultMode: current.toolResultMode,
+    toolErrors: current.toolErrors,
+  };
+  if (transcriptMatchesPreset(transcript, "simple")) return "simple";
+  if (transcriptMatchesPreset(transcript, "thinking")) return "thinking";
+  if (transcriptMatchesPreset(transcript, "verbose")) return "verbose";
+  return "custom";
+}
+
+export function applyChatTranscriptPreset(config: TgConfig, chatId: string, preset: TranscriptOutputPreset): boolean {
+  const current = getChatOutputPreferences(config, chatId);
+  return setChatOutputPreferences(config, chatId, {
+    ...current,
+    ...TRANSCRIPT_PRESET_PREFERENCES[preset],
+  });
 }
 
 function pruneChatPreference(config: TgConfig, chatId: string): void {
   const pref = config.chatPreferences?.[chatId];
   if (!pref) return;
-  const hasOutputMode = pref.outputMode === "verbose" || pref.outputMode === "thinking";
+  const normalizedOutput = normalizeStoredOutput(pref.output);
+  const hasStoredOutput = !!normalizedOutput;
   const hasMuted = pref.muted === true;
-  if (!hasOutputMode && !hasMuted) {
+  if (!hasStoredOutput && !hasMuted) {
     delete config.chatPreferences?.[chatId];
+    return;
   }
+  pref.output = normalizedOutput;
 }
 
-export function setChatOutputMode(config: TgConfig, chatId: string, mode: OutputMode): boolean {
-  if (getChatOutputMode(config, chatId) === mode) return false;
+export function setChatOutputPreferences(
+  config: TgConfig,
+  chatId: string,
+  output: ChatOutputPreferences
+): boolean {
+  const current = getChatOutputPreferences(config, chatId);
+  if (JSON.stringify(current) === JSON.stringify(output)) return false;
   if (!config.chatPreferences) config.chatPreferences = {};
-  const nextPref = { ...(config.chatPreferences[chatId] || {}) } as ChatPreferences & { thinking?: unknown };
-  if (mode === "compact") delete nextPref.outputMode;
-  else nextPref.outputMode = mode;
-  delete nextPref.thinking;
+  const nextPref: ChatPreferences = { ...(config.chatPreferences[chatId] || {}) };
+  const storedOutput: Partial<ChatOutputPreferences> = {};
+  if (output.thinkingMode !== DEFAULT_CHAT_OUTPUT_PREFERENCES.thinkingMode) storedOutput.thinkingMode = output.thinkingMode;
+  if (output.toolCallMode !== DEFAULT_CHAT_OUTPUT_PREFERENCES.toolCallMode) storedOutput.toolCallMode = output.toolCallMode;
+  if (output.toolResultMode !== DEFAULT_CHAT_OUTPUT_PREFERENCES.toolResultMode) storedOutput.toolResultMode = output.toolResultMode;
+  if (output.toolErrors !== DEFAULT_CHAT_OUTPUT_PREFERENCES.toolErrors) storedOutput.toolErrors = output.toolErrors;
+  if (output.backgroundJobs !== DEFAULT_CHAT_OUTPUT_PREFERENCES.backgroundJobs) storedOutput.backgroundJobs = output.backgroundJobs;
+  if (output.typingIndicator !== DEFAULT_CHAT_OUTPUT_PREFERENCES.typingIndicator) storedOutput.typingIndicator = output.typingIndicator;
+  nextPref.output = Object.keys(storedOutput).length > 0 ? storedOutput : undefined;
   config.chatPreferences[chatId] = nextPref;
   pruneChatPreference(config, chatId);
   return true;
+}
+
+export function getChatMuted(config: TgConfig, chatId: string): boolean {
+  return config.chatPreferences?.[chatId]?.muted === true;
 }
 
 export function setChatMuted(config: TgConfig, chatId: string, enabled: boolean): boolean {
@@ -112,6 +227,7 @@ export function setChatMuted(config: TgConfig, chatId: string, enabled: boolean)
   pruneChatPreference(config, chatId);
   return true;
 }
+
 
 export function getTelegramChannelEntries(config: TgConfig): Array<[string, ChannelConfig]> {
   return Object.entries(config.channels).filter(([, ch]) => ch.type === "telegram");

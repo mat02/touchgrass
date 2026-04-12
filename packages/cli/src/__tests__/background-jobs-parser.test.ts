@@ -511,6 +511,45 @@ describe("background job parser", () => {
     }
   });
 
+  it("prefers a plan artifact attachment when OMP review text is too long", () => {
+    __cliRunTestUtils.resetParserState();
+
+    const root = mkdtempSync(join(tmpdir(), "tg-omp-plan-attachment-"));
+    try {
+      const sessionFile = join(root, "session.jsonl");
+      const localDir = join(root, "session", "local");
+      mkdirSync(localDir, { recursive: true });
+      const longPlan = "# Review Plan\n\n" + "A".repeat(3600);
+      const artifactPath = join(localDir, "LONG_PLAN.md");
+      writeFileSync(artifactPath, longPlan);
+
+      const parsed = __cliRunTestUtils.parseJsonlMessage(
+        {
+          type: "message",
+          message: {
+            role: "toolResult",
+            toolName: "exit_plan_mode",
+            content: [{ type: "text", text: "Plan ready for approval." }],
+            isError: false,
+            details: {
+              title: "LONG_PLAN",
+              finalPlanFilePath: "local://LONG_PLAN.md",
+            },
+          },
+        },
+        sessionFile
+      );
+
+      expect(parsed.assistantText).toBe("⛳ Plan ready for approval: LONG_PLAN");
+      expect(parsed.assistantArtifact).toEqual({
+        path: artifactPath,
+        caption: "Plan review artifact",
+      });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
 
   it("forwards Claude Task tool results for simple-mode summarization", () => {
     __cliRunTestUtils.resetParserState();

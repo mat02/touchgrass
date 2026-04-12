@@ -36,6 +36,36 @@ describe("tool display formatting", () => {
     expect(rendered).toContain("<pre>");
   });
 
+  it("supports lowercase OMP file/search tool names in simple mode", () => {
+    expect(formatToolCall(fmt, "read", { path: "/repo/src/index.ts" }, "simple", "/repo")).toContain("src/index.ts");
+    expect(formatToolCall(fmt, "write", { path: "/repo/src/index.ts", content: "hello" }, "simple", "/repo")).toContain("src/index.ts");
+    expect(formatToolCall(fmt, "grep", { pattern: "outputMode", path: "/repo/src" }, "simple", "/repo")).toContain("outputMode");
+    expect(formatToolCall(fmt, "find", { pattern: "src/**/*.ts" }, "simple", "/repo")).toContain("src/**/*.ts");
+  });
+
+  it("summarizes todo_write calls in simple mode", () => {
+    const rendered = formatToolCall(
+      fmt,
+      "todo_write",
+      { ops: [{ op: "update", id: "task-2" }] },
+      "simple"
+    );
+    expect(rendered).toContain("todo_write");
+    expect(rendered).toContain("task-2");
+  });
+
+  it("suppresses exit_plan_mode tool calls", () => {
+    expect(formatToolCall(fmt, "exit_plan_mode", { title: "MY_PLAN" }, "simple")).toBeNull();
+    expect(formatToolCall(fmt, "exit_plan_mode", { title: "MY_PLAN" }, "verbose")).toBeNull();
+  });
+
+  it("shows fallback detail for unknown tools when available", () => {
+    const rendered = formatToolCall(fmt, "UnknownTool", { path: "/repo/file.ts" }, "simple", "/repo");
+    expect(rendered).toContain("UnknownTool");
+    expect(rendered).toContain("file.ts");
+  });
+
+
   it("shows unknown tool calls in simple mode as generic tool entries", () => {
     const rendered = formatToolCall(fmt, "UnknownTool", {}, "simple");
     expect(rendered).toContain("UnknownTool");
