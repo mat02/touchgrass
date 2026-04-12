@@ -1,11 +1,12 @@
 # ⛳ touchgrass.sh
 
-Use Telegram as a remote controller for Claude Code, Codex, Kimi, Pi and more.
+Use Telegram as a remote controller for Claude Code, Codex, Kimi, Pi, OMP, and more.
 
 - **Zero config** — wraps your existing CLI tools, no new runtime to learn
 - **Works from your phone** — send prompts, approve tools, attach files from Telegram
-- **Multi-tool** — supports Claude Code, Codex, Pi, Kimi out of the box
+- **Multi-tool** — supports Claude Code, Codex, Pi, OMP, and Kimi out of the box
 - **Lightweight** — just a PTY bridge + daemon, auto-starts and auto-stops
+- **Fork additions** — improved Telegram output controls, better OMP tool formatting, and safer plan review delivery
 
 ## Table of Contents
 
@@ -21,14 +22,23 @@ Use Telegram as a remote controller for Claude Code, Codex, Kimi, Pi and more.
 macOS / Linux:
 
 ```bash
-curl -fsSL https://touchgrass.sh/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/mat02/touchgrass/main/install.sh | bash
 ```
 
 Windows (PowerShell):
 
 ```powershell
-irm https://touchgrass.sh/install.ps1 | iex
+irm https://raw.githubusercontent.com/mat02/touchgrass/main/install.ps1 | iex
 ```
+
+These installers are fetched from this repository and download GitHub release assets from `mat02/touchgrass`.
+They do not install upstream `touchgrass.sh` releases.
+
+## Fork-specific changes
+
+- Added OMP session support (`touchgrass omp`) and improved compact Telegram rendering for OMP tool calls
+- Reworked Telegram output controls around `/output_mode` presets (`simple`, `thinking`, `verbose`) plus a guided custom wizard and granular setters
+- Kept assistant/control-plane updates always visible and improved long OMP plan reviews by sending an attachment when inline delivery would be too large
 
 ## Setup
 
@@ -50,6 +60,7 @@ Pair from Telegram by DMing your bot: `/pair <code>` (the code is printed by `to
 touchgrass claude
 touchgrass codex
 touchgrass pi
+touchgrass omp
 touchgrass kimi
 ```
 
@@ -90,7 +101,7 @@ touchgrass codex --sandbox workspace-write --ask-for-approval untrusted
 
 Two processes cooperate:
 
-1. CLI process (`touchgrass claude` / `touchgrass codex` / `touchgrass pi` / `touchgrass kimi`):
+1. CLI process (`touchgrass claude` / `touchgrass codex` / `touchgrass pi` / `touchgrass omp` / `touchgrass kimi`):
 - starts PTY
 - watches tool JSONL output (the session files for the CLIs)
 - sends output to selected chat destination
@@ -107,7 +118,7 @@ Two processes cooperate:
   Use: `touchgrass setup --list-channels`, `touchgrass setup --channel <name> --show`, `touchgrass setup --channel <name>`.
 - **Runtime chat channel**: a concrete DM/group/topic the daemon can route to right now.
   Use: `touchgrass channels`.
-- **Session**: a running bridged CLI process (`touchgrass claude`, `touchgrass codex`, `touchgrass pi`, `touchgrass kimi`) with an `r-...` id.
+- **Session**: a running bridged CLI process (`touchgrass claude`, `touchgrass codex`, `touchgrass pi`, `touchgrass omp`, `touchgrass kimi`) with an `r-...` id.
   Use: `touchgrass ls`, `touchgrass stop <id>`, `touchgrass kill <id>`, `touchgrass send <id> ...`.
 
 ### Telegram commands
@@ -117,10 +128,12 @@ Two processes cooperate:
 - `/files` (or `@?<query>`) — inline file picker; select `@path` entries for your next message.
 - `@?<query> - <prompt>` — resolve top fuzzy match and send `@path - prompt` directly.
 - `/change_session` — switch to a different running session.
-- `/output_mode simple|verbose` — set bridge verbosity for this chat.
-- `/thinking on|off|toggle` — toggle thinking previews for this chat.
-- `/background_jobs` — list running background jobs for connected sessions.
-
+- `/output_mode` — show current transcript/extras summary and open the preset picker (`Simple`, `Thinking`, `Verbose`, `Custom`).
+- `/output_mode simple|thinking|verbose` — apply transcript presets without resetting background-job or typing-indicator extras.
+- `/output_mode thinking off|preview|full` — control thinking visibility.
+- `/output_mode tool_calls off|compact|detailed` — control tool-call notifications.
+- `/output_mode tool_results off|compact|full` — control tool-result notifications.
+- `/output_mode tool_errors on|off`, `/output_mode background_jobs on|off`, `/output_mode typing on|off` — adjust the remaining Telegram delivery controls.
 ## Touchgrass CLI reference
 
 ### Bridge sessions
@@ -129,12 +142,14 @@ Two processes cooperate:
 touchgrass claude [args]
 touchgrass codex [args]
 touchgrass pi [args]
+touchgrass omp [args]
 touchgrass kimi [args]
 ```
 
 - `touchgrass claude [args]`: run Claude Code with touchgrass bridge.
 - `touchgrass codex [args]`: run Codex with touchgrass bridge.
 - `touchgrass pi [args]`: run PI with touchgrass bridge.
+- `touchgrass omp [args]`: run Oh My Pi with touchgrass bridge.
 - `touchgrass kimi [args]`: run Kimi with touchgrass bridge.
 
 ### Setup and health
@@ -189,11 +204,14 @@ touchgrass send --file <id> ./notes.md
 
 ## FAQ
 
-**Does touchgrass change how Claude/Codex/PI/Kimi run?**
-No. You still run the normal local terminal CLI.
+**Does touchgrass change how Claude/Codex/PI/Kimi/OMP run?**
+No. You still run the normal local terminal CLI; touchgrass only bridges the session to Telegram.
 
 **Can I type locally and from chat at the same time?**
 Yes, but avoid simultaneous input bursts to prevent interleaving.
+
+**Do the install scripts fetch from upstream touchgrass.sh?**
+No. The install commands in this README fetch the installer scripts from `mat02/touchgrass`, and those scripts download release binaries from this same repository’s GitHub releases.
 
 **Does touchgrass include a non-interactive autonomous runtime?**
 No. This project is focused on remote terminal control only.
@@ -202,7 +220,7 @@ No. This project is focused on remote terminal control only.
 
 - Bun runtime
 - Telegram account
-- Local Claude/Codex/PI/Kimi CLI installed
+- Local Claude/Codex/PI/Kimi/OMP CLI installed
 
 ## License
 

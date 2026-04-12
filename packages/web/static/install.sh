@@ -126,7 +126,7 @@ else
       echo ""
       info "For PowerShell users, run:"
       echo ""
-      echo "    irm https://touchgrass.sh/install.ps1 | iex"
+      echo "    irm https://raw.githubusercontent.com/mat02/touchgrass/main/install.ps1 | iex"
     else
       info "Add this to your shell profile:"
       echo ""

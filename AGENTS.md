@@ -177,7 +177,7 @@ New trait variants can be added within slot limits without breaking existing DNA
 
 - Telegram is the only supported channel.
 - This repo workflow is local-dev only.
-- Installer sync rule: whenever `install.sh` or `install.ps1` changes, update/redeploy the website so `https://touchgrass.sh/install.sh` and `https://touchgrass.sh/install.ps1` serve the latest versions.
+- Installer sync rule: keep `install.sh`, `install.ps1`, and `packages/web/static/install.*` in sync. Public install commands should use the raw GitHub URLs for this repo (`https://raw.githubusercontent.com/mat02/touchgrass/main/install.sh` and `https://raw.githubusercontent.com/mat02/touchgrass/main/install.ps1`), and those scripts must continue downloading release assets from `mat02/touchgrass`.
 - Restart the daemon before testing runtime changes:
 ```bash
 old_pid=$(cat ~/.touchgrass/daemon.pid 2>/dev/null || true)
