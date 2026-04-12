@@ -8,6 +8,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
+BUN_CMD=(npm exec -- bun)
+
 VERSION="${1:-}"
 if [ -z "$VERSION" ]; then
   # Read from CLI package.json
@@ -32,7 +34,7 @@ for entry in "${TARGETS[@]}"; do
   TARGET="${entry%%:*}"
   OUTPUT="${entry##*:}"
   echo "  Building ${OUTPUT} (${TARGET})..."
-  bun build "$REPO_ROOT/packages/cli/src/main.ts" --compile --target="$TARGET" --outfile "${DIST_DIR}/${OUTPUT}" 2>&1 | tail -1
+  "${BUN_CMD[@]}" build "$REPO_ROOT/packages/cli/src/main.ts" --compile --target="$TARGET" --outfile "${DIST_DIR}/${OUTPUT}" 2>&1 | tail -1
 done
 
 echo ""
