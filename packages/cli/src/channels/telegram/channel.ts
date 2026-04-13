@@ -85,7 +85,10 @@ const TELEGRAM_COMMANDS = {
   session: { command: "session", description: "Show current session" },
   name: { command: "name", description: "Rename current session" },
   changeSession: { command: "change_session", description: "Switch session" },
-  outputMode: { command: "output_mode", description: "Configure output" },
+  throttle: { command: "throttle", description: "Configure output" },
+  outputMode: { command: "output_mode", description: "Advanced output settings" },
+  mute: { command: "mute", description: "Pause bridge output" },
+  unmute: { command: "unmute", description: "Resume bridge output" },
   skills: { command: "skills", description: "List agent skills" },
   startRemoteControl: { command: "start_remote_control", description: "Connect a session" },
   stopRemoteControl: { command: "stop_remote_control", description: "Disconnect this chat" },
@@ -99,7 +102,7 @@ function parseNumericChannelId(id: string): number | null {
 }
 
 function buildCommandMenu(
-  ctx: Pick<CommandMenuContext, "isPaired" | "isGroup" | "isLinkedGroup" | "hasActiveSession">
+  ctx: Pick<CommandMenuContext, "isPaired" | "isGroup" | "isLinkedGroup" | "hasActiveSession" | "isMuted">
 ): TelegramBotCommand[] {
   if (!ctx.isPaired) return [TELEGRAM_COMMANDS.pair];
 
@@ -114,7 +117,9 @@ function buildCommandMenu(
       TELEGRAM_COMMANDS.changeSession,
       TELEGRAM_COMMANDS.session,
       TELEGRAM_COMMANDS.name,
+      TELEGRAM_COMMANDS.throttle,
       TELEGRAM_COMMANDS.outputMode,
+      ctx.isMuted ? TELEGRAM_COMMANDS.unmute : TELEGRAM_COMMANDS.mute,
       TELEGRAM_COMMANDS.skills
     );
   } else {

@@ -48,6 +48,7 @@ export interface CommandMenuContext {
   isGroup: boolean;
   isLinkedGroup: boolean;
   hasActiveSession: boolean;
+  isMuted: boolean;
 }
 
 export type PollAnswerHandler = (answer: {

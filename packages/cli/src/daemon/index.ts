@@ -235,6 +235,7 @@ export async function startDaemon(): Promise<void> {
         isGroup,
         isLinkedGroup: isGroup ? isLinkedGroup(config, chatId) : false,
         hasActiveSession: !!sessionManager.getAttachedRemote(chatId),
+        isMuted: getChatMuted(config, chatId),
       });
     })().catch(async (error: unknown) => {
       await logger.debug("Failed to sync command menu from daemon lifecycle", {

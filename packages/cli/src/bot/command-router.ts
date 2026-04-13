@@ -3,7 +3,13 @@ import { isTopic, getParentChatId } from "../channel/types";
 import type { TgConfig } from "../config/schema";
 import type { SessionManager } from "../session/manager";
 import { isUserPaired } from "../security/allowlist";
-import { addLinkedGroup, removeLinkedGroup, isLinkedGroup, updateLinkedGroupTitle } from "../config/schema";
+import {
+  addLinkedGroup,
+  getChatMuted,
+  isLinkedGroup,
+  removeLinkedGroup,
+  updateLinkedGroupTitle,
+} from "../config/schema";
 import { saveConfig } from "../config/store";
 import { handlePair } from "./handlers/pair";
 import { handleHelp } from "./handlers/help";
@@ -15,6 +21,7 @@ import { handleNameCommand } from "./handlers/name";
 import { handleOutputModeCommand } from "./handlers/output-mode";
 import type { BackgroundJobSessionSummary } from "./handlers/background-jobs";
 import { handleSkillsCommand } from "./handlers/skills";
+import { handleMuteCommand } from "./handlers/mute";
 import { handleStartRemoteControl, handleStopRemoteControl } from "./handlers/remote-control";
 import { logger } from "../daemon/logger";
 import { notifyApp } from "../daemon/notify-app";
@@ -39,6 +46,7 @@ function syncCommandMenuAsync(
     isGroup: boolean;
     isLinkedGroup: boolean;
     hasActiveSession: boolean;
+    isMuted: boolean;
   }
 ): void {
   const sync = ctx.channel.syncCommandMenu;
@@ -75,6 +83,9 @@ export async function routeMessage(
     else if (rest === " change_session" || rest === " change-session") text = "/change_session";
     else if (rest === " output_mode" || rest.startsWith(" output_mode ")) text = `/output_mode${rest.slice(" output_mode".length)}`;
     else if (rest === " output-mode" || rest.startsWith(" output-mode ")) text = `/output_mode${rest.slice(" output-mode".length)}`;
+    else if (rest === " throttle" || rest.startsWith(" throttle ")) text = `/throttle${rest.slice(" throttle".length)}`;
+    else if (rest === " mute") text = "/mute";
+    else if (rest === " unmute") text = "/unmute";
     else if (rest === " skills") text = "/skills";
     else if (rest === " link" || rest.startsWith(" link ")) text = `/link${rest.slice(" link".length)}`;
     else if (rest === " unlink") text = "/unlink";
@@ -91,6 +102,7 @@ export async function routeMessage(
   const linked = isLinkedGroup(ctx.config, chatId, channelName);
   const paired = isUserPaired(ctx.config, userId);
   const hasActiveSession = !!ctx.sessionManager.getAttachedRemote(chatId);
+  const isMuted = getChatMuted(ctx.config, chatId);
 
   syncCommandMenuAsync(ctx, {
     userId,
@@ -99,6 +111,7 @@ export async function routeMessage(
     isGroup,
     isLinkedGroup: linked,
     hasActiveSession,
+    isMuted,
   });
 
   await logger.debug("Received message", {
@@ -118,6 +131,7 @@ export async function routeMessage(
       isGroup,
       isLinkedGroup: isLinkedGroup(ctx.config, chatId, channelName),
       hasActiveSession: !!ctx.sessionManager.getAttachedRemote(chatId),
+      isMuted: getChatMuted(ctx.config, chatId),
     });
     return;
   }
@@ -147,7 +161,26 @@ export async function routeMessage(
     return;
   }
 
-  if (text === "/mute" || text === "/unmute" || text === "/stop" || text === "/kill" || text === "/new" || text === "/start" || text.startsWith("/start ") || text.startsWith("/new ")) {
+  if (text === "/mute" || text === "/unmute") {
+    await handleMuteCommand({ ...msg, text }, text === "/mute", ctx);
+    syncCommandMenuAsync(ctx, {
+      userId,
+      chatId,
+      isPaired: paired,
+      isGroup,
+      isLinkedGroup: linked,
+      hasActiveSession: !!ctx.sessionManager.getAttachedRemote(chatId),
+      isMuted: getChatMuted(ctx.config, chatId),
+    });
+    return;
+  }
+
+  if (text.startsWith("/mute ") || text.startsWith("/unmute ")) {
+    await ctx.channel.send(chatId, `Use ${fmt.code("/mute")} or ${fmt.code("/unmute")} with no arguments.`);
+    return;
+  }
+
+  if (text === "/stop" || text === "/kill" || text === "/new" || text === "/start" || text.startsWith("/start ") || text.startsWith("/new ")) {
     await ctx.channel.send(
       chatId,
       `${fmt.escape("⛳️ Chat-side session start/stop was removed. Start sessions from your terminal with")} ${fmt.code("touchgrass claude")}, ${fmt.code("touchgrass codex")}, ${fmt.code("touchgrass pi")}, ${fmt.code("touchgrass omp")}, ${fmt.code("touchgrass kimi")}, ${fmt.code("touchgrass gemini")} ${fmt.escape("and use")} ${fmt.code("touchgrass stop <id>")} ${fmt.escape("or")} ${fmt.code("touchgrass kill <id>")} ${fmt.escape("from terminal when needed.")}`
@@ -242,6 +275,7 @@ export async function routeMessage(
       isGroup,
       isLinkedGroup: linked,
       hasActiveSession: !!ctx.sessionManager.getAttachedRemote(chatId),
+      isMuted: getChatMuted(ctx.config, chatId),
     });
     return;
   }
@@ -265,9 +299,18 @@ export async function routeMessage(
     return;
   }
 
-  // /output_mode [preset|setting value] — configure Telegram output delivery
-  if (text === "/output_mode" || text === "/output-mode" || text.startsWith("/output_mode ") || text.startsWith("/output-mode ")) {
-    const modeArg = text.replace(/^\/output(?:_|-)mode/i, "").trim() || undefined;
+  // /output_mode or /throttle [preset|setting value] — configure Telegram output delivery
+  if (
+    text === "/output_mode"
+    || text === "/output-mode"
+    || text.startsWith("/output_mode ")
+    || text.startsWith("/output-mode ")
+    || text === "/throttle"
+    || text.startsWith("/throttle ")
+  ) {
+    const modeArg = text.startsWith("/throttle")
+      ? text.slice("/throttle".length).trim() || undefined
+      : text.replace(/^\/output(?:_|-)mode/i, "").trim() || undefined;
     await handleOutputModeCommand({ ...msg, text }, modeArg, ctx);
     return;
   }
@@ -313,6 +356,7 @@ export async function routeMessage(
         isGroup,
         isLinkedGroup: isLinkedGroup(ctx.config, chatId, channelName),
         hasActiveSession: !!ctx.sessionManager.getAttachedRemote(chatId),
+        isMuted: getChatMuted(ctx.config, chatId),
       });
     } else {
       const added = addLinkedGroup(ctx.config, chatId, msg.chatTitle, channelName);
@@ -330,6 +374,7 @@ export async function routeMessage(
         isGroup,
         isLinkedGroup: isLinkedGroup(ctx.config, chatId, channelName),
         hasActiveSession: !!ctx.sessionManager.getAttachedRemote(chatId),
+        isMuted: getChatMuted(ctx.config, chatId),
       });
     }
     return;
@@ -355,6 +400,7 @@ export async function routeMessage(
       isGroup,
       isLinkedGroup: isLinkedGroup(ctx.config, chatId, channelName),
       hasActiveSession: !!ctx.sessionManager.getAttachedRemote(chatId),
+      isMuted: getChatMuted(ctx.config, chatId),
     });
     return;
   }
