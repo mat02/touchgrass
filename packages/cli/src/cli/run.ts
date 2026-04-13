@@ -35,6 +35,11 @@ const APPROVAL_PATTERNS: Record<string, { promptText: string; optionText: string
 };
 
 // Test-only accessors for CLI arg parsing behavior.
+interface OmpSessionWatchDecision {
+  nextSessionFile: string | null;
+  replaceCurrent: boolean;
+}
+
 export const __cliRunTestUtils = {
   encodeBracketedPaste,
   buildResumeCommandArgs,
@@ -44,6 +49,8 @@ export const __cliRunTestUtils = {
   parseJsonlMessage,
   isVersionBelow,
   extractApprovalPrompt,
+  selectOmpRolloverSessionFile,
+  planOmpSessionWatchDecision,
   resetParserState: () => {
     toolUseIdToName.clear();
     toolUseIdToInput.clear();
@@ -446,6 +453,37 @@ function readSessionIdsFromJsonl(filePath: string, maxLines = 80): Set<string> {
   } catch {}
   return ids;
 }
+
+function selectOmpRolloverSessionFile(
+  activeSessionFile: string | null,
+  sessionFiles: string[]
+): string | null {
+  if (!activeSessionFile) return null;
+  const newestSessionFile = sessionFiles[0];
+  if (!newestSessionFile) return null;
+  return newestSessionFile !== activeSessionFile ? newestSessionFile : null;
+}
+
+function planOmpSessionWatchDecision(
+  activeSessionFile: string | null,
+  hasWatcher: boolean,
+  sessionFiles: string[],
+  existingFiles: ReadonlySet<string>
+): OmpSessionWatchDecision {
+  if (!hasWatcher) {
+    return {
+      nextSessionFile: sessionFiles.find((filePath) => !existingFiles.has(filePath)) || null,
+      replaceCurrent: false,
+    };
+  }
+
+  const rolloverSessionFile = selectOmpRolloverSessionFile(activeSessionFile, sessionFiles);
+  return {
+    nextSessionFile: rolloverSessionFile,
+    replaceCurrent: rolloverSessionFile !== null,
+  };
+}
+
 
 // ── Single-pass JSONL message parser ──────────────────────────────
 // Extracts assistant text, thinking, questions, tool calls, and tool results
@@ -2556,14 +2594,22 @@ export async function runRun(): Promise<void> {
         }
         if (cmdName === "omp") {
           try {
-            const unseen = listOmpSessionFiles(process.cwd())
-              .filter((filePath) => !existingFiles.has(filePath));
-            for (const filePath of unseen) {
+            const sessionFiles = listOmpSessionFiles(process.cwd());
+            const watchDecision = planOmpSessionWatchDecision(
+              activeSessionFile,
+              !!watcherRef.current,
+              sessionFiles,
+              existingFiles
+            );
+            for (const filePath of sessionFiles) {
               existingFiles.add(filePath);
-              if (!watcherRef.current) {
-                startFileWatch(filePath);
-                return;
-              }
+            }
+            if (watchDecision.nextSessionFile) {
+              startFileWatch(
+                watchDecision.nextSessionFile,
+                false,
+                watchDecision.replaceCurrent
+              );
             }
           } catch {}
           return;
