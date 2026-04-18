@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Build release binaries and create a GitHub release
 # Usage: ./scripts/release.sh [version]
-# Example: ./scripts/release.sh v0.1.124
+# Example: ./scripts/release.sh v0.1.125
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
