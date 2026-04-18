@@ -35,13 +35,57 @@ function extractFallbackToolDetail(input: Record<string, unknown>, cwd?: string)
   return getFirstString(input, ["id", "taskId", "task_id"]);
 }
 
+function summarizeTodoWriteOp(op: Record<string, unknown>): string {
+  const action = (getFirstString(op, ["op"]) || "update").toLowerCase();
+  const id = getFirstString(op, ["id", "taskId", "task_id"]);
+  const title = getFirstString(op, ["title", "content", "text", "name", "task"]);
+  const phase = getFirstString(op, ["phase", "phase_id", "phaseId"]);
+
+  switch (action) {
+    case "replace": {
+      const entries = [op.tasks, op.todos, op.items].find((value) => Array.isArray(value));
+      const count = Array.isArray(entries) ? entries.length : undefined;
+      if (count !== undefined) return `replace list (${count} ${count === 1 ? "item" : "items"})`;
+      return title ? `replace list: ${truncateText(title, 80)}` : "replace list";
+    }
+    case "add_phase":
+      return phase ? `add phase ${truncateText(phase, 60)}` : (title ? `add phase ${truncateText(title, 60)}` : "add phase");
+    case "add_task": {
+      const status = getFirstString(op, ["status"]);
+      const parts = ["add task"];
+      if (id) parts.push(id);
+      if (title) parts.push(`\"${truncateText(title, 70)}\"`);
+      if (phase) parts.push(`in ${truncateText(phase, 40)}`);
+      if (status) parts.push(`[${status}]`);
+      return parts.join(" ");
+    }
+    case "remove_task":
+      if (id) return `remove task ${id}`;
+      if (title) return `remove task \"${truncateText(title, 70)}\"`;
+      return "remove task";
+    case "update": {
+      const status = getFirstString(op, ["status"]);
+      const nextContent = getFirstString(op, ["content", "title", "text"]);
+      const parts = [id ? `update ${id}` : "update task"];
+      if (status) parts.push(`→ ${status}`);
+      if (nextContent) parts.push(`\"${truncateText(nextContent, 70)}\"`);
+      return parts.join(" ");
+    }
+    default: {
+      const target = getFirstString(op, ["id", "phase", "name", "title"]);
+      if (target) return `${action} ${truncateText(target, 70)}`;
+      return action || "todo change";
+    }
+  }
+}
+
 function formatTodoWriteToolCall(fmt: Formatter, input: Record<string, unknown>): string {
   const ops = Array.isArray(input.ops) ? input.ops.filter((op): op is Record<string, unknown> => !!op && typeof op === "object") : [];
-  const firstOp = ops[0];
-  const action = getFirstString(firstOp || {}, ["op"]) || "update";
-  const id = getFirstString(firstOp || {}, ["id", "phase", "name"]);
-  const countLabel = ops.length > 1 ? `${ops.length} ops` : (id ? `${action} ${id}` : action);
-  return `${fmt.escape("🧩")} ${fmt.code(fmt.escape("todo_write"))} ${fmt.escape("•")} ${fmt.escape(countLabel)}`;
+  const details = ops.map((op) => summarizeTodoWriteOp(op));
+  const head = details.slice(0, 3).join("; ");
+  const remainder = details.length > 3 ? ` +${details.length - 3} more` : "";
+  const summary = head ? `${head}${remainder}` : `${ops.length > 1 ? `${ops.length} ops` : "update"}`;
+  return `${fmt.escape("🧩")} ${fmt.code(fmt.escape("todo_write"))} ${fmt.escape("•")} ${fmt.escape(summary)}`;
 }
 function relativePath(fp: string, cwd?: string): string {
   if (!cwd) return fp;

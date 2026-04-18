@@ -84,6 +84,44 @@ describe("daemon output controls", () => {
     expect(shown).toContain("permission denied");
   });
 
+  it("builds replay output with separate last assistant message", () => {
+    const rawLines: string[] = [
+      JSON.stringify({
+        type: "assistant",
+        message: { content: [{ type: "text", text: "assistant message outside recent slice" }] },
+      }),
+    ];
+    for (let i = 0; i < 12; i++) {
+      rawLines.push(
+        JSON.stringify({
+          type: "user",
+          message: { content: [{ type: "text", text: `user ${i}` }] },
+        })
+      );
+    }
+
+    const replay = __daemonTestUtils.buildRecentActivityReplayMessages(fmt, rawLines.join("\n"), 2);
+
+    expect(replay.summaryMessage).toContain("📋 Recent activity:");
+    expect(replay.summaryMessage).toContain("<b>[User]</b> user 10");
+    expect(replay.summaryMessage).toContain("<b>[User]</b> user 11");
+    expect(replay.summaryMessage).not.toContain("assistant message outside recent slice");
+    expect(replay.assistantMessage).toBe("🤖 <b>[Assistant]</b> assistant message outside recent slice");
+  });
+
+  it("does not fabricate assistant replay when none exists", () => {
+    const raw = [
+      JSON.stringify({ type: "user", message: { content: [{ type: "text", text: "u1" }] } }),
+      JSON.stringify({ type: "user", message: { content: [{ type: "text", text: "u2" }] } }),
+    ].join("\n");
+
+    const replay = __daemonTestUtils.buildRecentActivityReplayMessages(fmt, raw, 10);
+
+    expect(replay.summaryMessage).toContain("📋 Recent activity:");
+    expect(replay.assistantMessage).toBeNull();
+  });
+
+
   it("serializes ordered deliveries within a chat", async () => {
     const calls: string[] = [];
     let releaseFirst!: () => void;

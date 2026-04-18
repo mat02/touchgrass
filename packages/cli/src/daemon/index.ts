@@ -45,9 +45,9 @@ import { InternalChannel } from "../channels/internal/channel";
 import type { Formatter } from "../channel/formatter";
 import type { Channel, ChannelChatId, ChannelUserId } from "../channel/types";
 import { getChannelName, getChannelType, getRootChatIdNumber, parseChannelAddress } from "../channel/id";
-import type { AskQuestion, PendingFilePickerOption, PendingOutputModeOption, PendingRecentMessagesPoll } from "../session/manager";
+import type { AskQuestion, PendingFilePickerOption, PendingOutputModeOption } from "../session/manager";
 import { readManifests } from "../bot/handlers/remote-control";
-import { collectEntriesFromRaw, type DisplayEntry } from "../cli/peek";
+import { collectRecentActivityPreviewFromRaw, type DisplayEntry } from "../cli/peek";
 import { chmod, open, readFile, realpath, stat, writeFile } from "fs/promises";
 import { basename, dirname, join, resolve } from "path";
 
@@ -102,6 +102,35 @@ function formatToolResultNotification(
   return formatSimpleToolResult(fmt, toolName, content, isError);
 }
 
+function buildRecentActivityReplayMessages(
+  fmt: Formatter,
+  raw: string,
+  count: number
+ ): { summaryMessage: string | null; assistantMessage: string | null } {
+  const { recentEntries, lastAssistantEntry } = collectRecentActivityPreviewFromRaw(raw, count);
+  if (recentEntries.length === 0) {
+    return { summaryMessage: null, assistantMessage: null };
+  }
+
+  const lines = recentEntries.map((entry: DisplayEntry) => {
+    const roleLabel = entry.role === "assistant" ? "Assistant" : entry.role === "user" ? "User" : "Tool";
+    const text = entry.text.length > 200 ? `${entry.text.slice(0, 200)}…` : entry.text;
+    return `${fmt.bold(`[${roleLabel}]`)} ${fmt.escape(text)}`;
+  });
+
+  const summaryMessage = `${fmt.escape("📋")} Recent activity:\n\n${lines.join("\n")}`;
+  if (!lastAssistantEntry) {
+    return { summaryMessage, assistantMessage: null };
+  }
+
+  const assistantText = lastAssistantEntry.text.length > 1200
+    ? `${lastAssistantEntry.text.slice(0, 1200)}…`
+    : lastAssistantEntry.text;
+  const assistantMessage = `${fmt.escape("🤖")} ${fmt.bold("[Assistant]")} ${fmt.escape(assistantText)}`;
+  return { summaryMessage, assistantMessage };
+}
+
+
 function createOrderedConversationQueue(deps: {
   getTimeoutMs: () => number;
   logSkip: (chatId: ChannelChatId, error: Error) => Promise<void>;
@@ -154,6 +183,7 @@ export const __daemonTestUtils = {
   createQuestionPollScheduler,
   formatThinkingNotification,
   formatToolResultNotification,
+  buildRecentActivityReplayMessages,
 };
 
 type BackgroundJobStatus = "running" | "completed" | "failed" | "killed";
@@ -1911,15 +1941,13 @@ export async function startDaemon(): Promise<void> {
           const manifest = manifests.get(recentPoll.sessionId);
           if (manifest?.jsonlFile) {
             const raw = require("fs").readFileSync(manifest.jsonlFile, "utf-8") as string;
-            const entries = collectEntriesFromRaw(raw, 10);
-            if (entries.length > 0) {
-              const fmt = getFormatterForChat(recentPoll.chatId);
-              const lines = entries.map((e: DisplayEntry) => {
-                const roleLabel = e.role === "assistant" ? "Assistant" : e.role === "user" ? "User" : "Tool";
-                const text = e.text.length > 200 ? e.text.slice(0, 200) + "…" : e.text;
-                return `${fmt.bold(`[${roleLabel}]`)} ${fmt.escape(text)}`;
-              });
-              sendToChat(recentPoll.chatId, `${fmt.escape("📋")} Recent activity:\n\n${lines.join("\n")}`);
+            const fmt = getFormatterForChat(recentPoll.chatId);
+            const replay = buildRecentActivityReplayMessages(fmt, raw, 10);
+            if (replay.summaryMessage) {
+              sendToChat(recentPoll.chatId, replay.summaryMessage);
+              if (replay.assistantMessage) {
+                sendToChat(recentPoll.chatId, replay.assistantMessage);
+              }
             } else {
               sendToChat(recentPoll.chatId, "No recent messages found.");
             }

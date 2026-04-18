@@ -43,15 +43,39 @@ describe("tool display formatting", () => {
     expect(formatToolCall(fmt, "find", { pattern: "src/**/*.ts" }, "simple", "/repo")).toContain("src/**/*.ts");
   });
 
-  it("summarizes todo_write calls in simple mode", () => {
+  it("summarizes todo_write replace ops in simple mode", () => {
     const rendered = formatToolCall(
       fmt,
       "todo_write",
-      { ops: [{ op: "update", id: "task-2" }] },
+      { ops: [{ op: "replace", tasks: [{ id: "t1" }, { id: "t2" }] }] },
       "simple"
     );
+
     expect(rendered).toContain("todo_write");
-    expect(rendered).toContain("task-2");
+    expect(rendered).toContain("replace list");
+    expect(rendered).toContain("2 items");
+  });
+
+  it("summarizes todo_write updates with status/content and batches", () => {
+    const rendered = formatToolCall(
+      fmt,
+      "todo_write",
+      {
+        ops: [
+          { op: "update", id: "task-2", status: "completed" },
+          { op: "update", id: "task-3", content: "Write regression tests" },
+          { op: "add_task", id: "task-4", content: "Ship fix", status: "pending" },
+          { op: "remove_task", id: "task-1" },
+        ],
+      },
+      "simple"
+    );
+
+    expect(rendered).toContain("update task-2");
+    expect(rendered).toContain("completed");
+    expect(rendered).toContain("task-3");
+    expect(rendered).toContain("Write regression tests");
+    expect(rendered).toContain("+1 more");
   });
 
   it("suppresses exit_plan_mode tool calls", () => {

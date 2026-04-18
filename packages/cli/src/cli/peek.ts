@@ -64,8 +64,8 @@ export interface DisplayEntry {
 function extractEntries(msg: Record<string, unknown>): DisplayEntry[] {
   const entries: DisplayEntry[] = [];
 
-  // Gemini format (in full-file JSON array)
-  if (msg.type === "user" || msg.type === "gemini") {
+  // Gemini full-file format uses top-level content fields.
+  if (msg.type === "gemini" || (msg.type === "user" && (typeof msg.content === "string" || Array.isArray(msg.content)))) {
     const role = msg.type === "user" ? "user" : "assistant";
     let text = "";
     if (typeof msg.content === "string") {
@@ -266,9 +266,23 @@ function parseCount(countArg: string | undefined): number {
   return count;
 }
 
-export function collectEntriesFromRaw(raw: string, count: number): DisplayEntry[] {
+export interface RecentActivityPreview {
+  recentEntries: DisplayEntry[];
+  lastAssistantEntry: DisplayEntry | null;
+}
+
+function findLastAssistantEntry(entries: DisplayEntry[]): DisplayEntry | null {
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const entry = entries[i];
+    if (entry?.role === "assistant") return entry;
+  }
+  return null;
+}
+
+export function collectRecentActivityPreviewFromRaw(raw: string, count: number): RecentActivityPreview {
   const allEntries: DisplayEntry[] = [];
   const trimmed = raw.trim();
+  if (!trimmed) return { recentEntries: [], lastAssistantEntry: null };
 
   // Detect if this is a Gemini full-file JSON object (starts with { and has a messages array)
   if (trimmed.startsWith("{")) {
@@ -278,12 +292,15 @@ export function collectEntriesFromRaw(raw: string, count: number): DisplayEntry[
         for (const msg of data.messages) {
           allEntries.push(...extractEntries(msg));
         }
-        return allEntries.slice(-count);
+        return {
+          recentEntries: allEntries.slice(-count),
+          lastAssistantEntry: findLastAssistantEntry(allEntries),
+        };
       }
     } catch {}
   }
 
-  // Fallback to JSONL parsing (line by line)
+  // Fallback to JSONL parsing (line by line).
   const rawLines = trimmed.split("\n");
   const tail = rawLines.slice(-(count * 5));
 
@@ -291,13 +308,30 @@ export function collectEntriesFromRaw(raw: string, count: number): DisplayEntry[
     if (!line) continue;
     try {
       const msg = JSON.parse(line);
-      const entries = extractEntries(msg);
-      allEntries.push(...entries);
+      allEntries.push(...extractEntries(msg));
     } catch {}
   }
 
-  // Take last `count` entries
-  return allEntries.slice(-count);
+  let lastAssistantEntry: DisplayEntry | null = null;
+  for (let i = rawLines.length - 1; i >= 0; i--) {
+    const line = rawLines[i];
+    if (!line) continue;
+    try {
+      const msg = JSON.parse(line);
+      const entries = extractEntries(msg);
+      lastAssistantEntry = findLastAssistantEntry(entries);
+      if (lastAssistantEntry) break;
+    } catch {}
+  }
+
+  return {
+    recentEntries: allEntries.slice(-count),
+    lastAssistantEntry,
+  };
+}
+
+export function collectEntriesFromRaw(raw: string, count: number): DisplayEntry[] {
+  return collectRecentActivityPreviewFromRaw(raw, count).recentEntries;
 }
 
 function printUsage(): void {
