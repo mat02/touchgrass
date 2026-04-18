@@ -112,21 +112,27 @@ function buildRecentActivityReplayMessages(
     return { summaryMessage: null, assistantMessage: null };
   }
 
-  const lines = recentEntries.map((entry: DisplayEntry) => {
-    const roleLabel = entry.role === "assistant" ? "Assistant" : entry.role === "user" ? "User" : "Tool";
-    const text = entry.text.length > 200 ? `${entry.text.slice(0, 200)}…` : entry.text;
-    return `${fmt.bold(`[${roleLabel}]`)} ${fmt.escape(text)}`;
-  });
+  const recentSummaryEntries = (() => {
+    if (!lastAssistantEntry) return recentEntries;
+    const lastRecentEntry = recentEntries[recentEntries.length - 1];
+    if (lastRecentEntry?.role !== "assistant") return recentEntries;
+    if (lastRecentEntry.text !== lastAssistantEntry.text) return recentEntries;
+    return recentEntries.slice(0, -1);
+  })();
 
-  const summaryMessage = `${fmt.escape("📋")} Recent activity:\n\n${lines.join("\n")}`;
+  const summaryMessage = recentSummaryEntries.length > 0
+    ? `${fmt.escape("📋")} Recent activity:\n\n${recentSummaryEntries.map((entry: DisplayEntry) => {
+      const roleLabel = entry.role === "assistant" ? "Assistant" : entry.role === "user" ? "User" : "Tool";
+      const text = entry.text.length > 200 ? `${entry.text.slice(0, 200)}…` : entry.text;
+      return `${fmt.bold(`[${roleLabel}]`)} ${fmt.escape(text)}`;
+    }).join("\n")}`
+    : null;
+
   if (!lastAssistantEntry) {
     return { summaryMessage, assistantMessage: null };
   }
 
-  const assistantText = lastAssistantEntry.text.length > 1200
-    ? `${lastAssistantEntry.text.slice(0, 1200)}…`
-    : lastAssistantEntry.text;
-  const assistantMessage = `${fmt.escape("🤖")} ${fmt.bold("[Assistant]")} ${fmt.escape(assistantText)}`;
+  const assistantMessage = `${fmt.escape("🤖")} ${fmt.bold("[Assistant]")} ${fmt.escape(lastAssistantEntry.text)}`;
   return { summaryMessage, assistantMessage };
 }
 
@@ -1943,12 +1949,9 @@ export async function startDaemon(): Promise<void> {
             const raw = require("fs").readFileSync(manifest.jsonlFile, "utf-8") as string;
             const fmt = getFormatterForChat(recentPoll.chatId);
             const replay = buildRecentActivityReplayMessages(fmt, raw, 10);
-            if (replay.summaryMessage) {
-              sendToChat(recentPoll.chatId, replay.summaryMessage);
-              if (replay.assistantMessage) {
-                sendToChat(recentPoll.chatId, replay.assistantMessage);
-              }
-            } else {
+            if (replay.summaryMessage) sendToChat(recentPoll.chatId, replay.summaryMessage);
+            if (replay.assistantMessage) sendToChat(recentPoll.chatId, replay.assistantMessage);
+            if (!replay.summaryMessage && !replay.assistantMessage) {
               sendToChat(recentPoll.chatId, "No recent messages found.");
             }
           } else {

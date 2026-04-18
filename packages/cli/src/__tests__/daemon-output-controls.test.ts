@@ -84,7 +84,7 @@ describe("daemon output controls", () => {
     expect(shown).toContain("permission denied");
   });
 
-  it("builds replay output with separate last assistant message", () => {
+  it("builds replay output with separate last assistant message when assistant is outside recent slice", () => {
     const rawLines: string[] = [
       JSON.stringify({
         type: "assistant",
@@ -108,6 +108,49 @@ describe("daemon output controls", () => {
     expect(replay.summaryMessage).not.toContain("assistant message outside recent slice");
     expect(replay.assistantMessage).toBe("🤖 <b>[Assistant]</b> assistant message outside recent slice");
   });
+
+  it("omits the last assistant entry from summary when it is inside the recent slice", () => {
+    const raw = [
+      JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "older assistant" }] } }),
+      JSON.stringify({ type: "user", message: { content: [{ type: "text", text: "latest user" }] } }),
+      JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "latest assistant" }] } }),
+    ].join("\n");
+
+    const replay = __daemonTestUtils.buildRecentActivityReplayMessages(fmt, raw, 3);
+
+    expect(replay.summaryMessage).toContain("📋 Recent activity:");
+    expect(replay.summaryMessage).toContain("<b>[Assistant]</b> older assistant");
+    expect(replay.summaryMessage).toContain("<b>[User]</b> latest user");
+    expect(replay.summaryMessage).not.toContain("latest assistant");
+    expect(replay.assistantMessage).toBe("🤖 <b>[Assistant]</b> latest assistant");
+  });
+
+  it("returns full last assistant text without helper truncation", () => {
+    const longAssistantText = "A".repeat(1600);
+    const raw = [
+      JSON.stringify({ type: "user", message: { content: [{ type: "text", text: "u1" }] } }),
+      JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: longAssistantText }] } }),
+    ].join("\n");
+
+    const replay = __daemonTestUtils.buildRecentActivityReplayMessages(fmt, raw, 2);
+
+    expect(replay.summaryMessage).not.toContain(longAssistantText);
+    expect(replay.assistantMessage).toBe(`🤖 <b>[Assistant]</b> ${longAssistantText}`);
+    expect(replay.assistantMessage).not.toContain("…");
+  });
+
+  it("skips the brief summary when only the last assistant entry is recent", () => {
+    const raw = JSON.stringify({
+      type: "assistant",
+      message: { content: [{ type: "text", text: "only assistant" }] },
+    });
+
+    const replay = __daemonTestUtils.buildRecentActivityReplayMessages(fmt, raw, 10);
+
+    expect(replay.summaryMessage).toBeNull();
+    expect(replay.assistantMessage).toBe("🤖 <b>[Assistant]</b> only assistant");
+  });
+
 
   it("does not fabricate assistant replay when none exists", () => {
     const raw = [
