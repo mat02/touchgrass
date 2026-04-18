@@ -8,6 +8,7 @@ import {
   defaultSettings,
   setChatOutputPreferences,
   getChatOutputPreferences,
+  normalizeStoredChatPreference,
 } from "./schema";
 
 let cached: TgConfig | null = null;
@@ -77,6 +78,7 @@ export async function loadConfig(): Promise<TgConfig> {
     if (!parsed.chatPreferences || typeof parsed.chatPreferences !== "object") {
       parsed.chatPreferences = {};
     } else {
+      const legacyMutedActivatedAt = new Date().toISOString();
       for (const [chatId, pref] of Object.entries(parsed.chatPreferences)) {
         if (!pref || typeof pref !== "object") {
           delete parsed.chatPreferences[chatId];
@@ -86,6 +88,7 @@ export async function loadConfig(): Promise<TgConfig> {
           outputMode?: unknown;
           thinking?: unknown;
           muted?: unknown;
+          delivery?: unknown;
           output?: {
             thinkingMode?: unknown;
             toolCallMode?: unknown;
@@ -154,9 +157,12 @@ export async function loadConfig(): Promise<TgConfig> {
           }
         }
 
-        if (parsed.chatPreferences[chatId] && parsed.chatPreferences[chatId].muted !== true && parsed.chatPreferences[chatId].output === undefined) {
-          delete parsed.chatPreferences[chatId];
-        }
+        const normalizedPreference = normalizeStoredChatPreference(
+          parsed.chatPreferences[chatId],
+          legacyMutedActivatedAt
+        );
+        if (normalizedPreference) parsed.chatPreferences[chatId] = normalizedPreference;
+        else delete parsed.chatPreferences[chatId];
       }
     }
     // Ensure linkedGroups exists on all channels

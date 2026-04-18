@@ -7,10 +7,16 @@ import {
   updateLinkedGroupTitle,
   getChatOutputPreferences,
   getChatTranscriptPresetLabel,
-  getChatMuted,
+  getChatDeliveryPreference,
+  isChatDeliveryMuted,
   setChatOutputPreferences,
   applyChatTranscriptPreset,
-  setChatMuted,
+  clearChatDeliveryPreference,
+  createPermanentMuteDeliveryPreference,
+  createThrottleDeliveryPreference,
+  createTimedMuteDeliveryPreference,
+  normalizeStoredChatPreference,
+  setChatDeliveryPreference,
   type TgConfig,
   type ChannelConfig,
   type ChatOutputPreferences,
@@ -329,33 +335,91 @@ describe("chat output preferences", () => {
   });
 });
 
-describe("chat mute preference", () => {
-  it("defaults to unmuted", () => {
+describe("chat delivery preference", () => {
+  it("defaults to immediate delivery", () => {
     const config = makeConfig({ telegram: makeChannel("telegram") });
-    expect(getChatMuted(config, "telegram:100")).toBe(false);
+    expect(getChatDeliveryPreference(config, "telegram:100")).toEqual({ mode: "immediate" });
+    expect(isChatDeliveryMuted(config, "telegram:100")).toBe(false);
   });
 
-  it("enables and disables mute per chat", () => {
+  it("stores throttle delivery and clears back to immediate", () => {
     const config = makeConfig({ telegram: makeChannel("telegram") });
-    const enabled = setChatMuted(config, "telegram:100", true);
+    const enabled = setChatDeliveryPreference(
+      config,
+      "telegram:100",
+      createThrottleDeliveryPreference(5, "2026-04-18T10:00:00.000Z")
+    );
     expect(enabled).toBe(true);
-    expect(getChatMuted(config, "telegram:100")).toBe(true);
+    expect(getChatDeliveryPreference(config, "telegram:100")).toEqual({
+      mode: "throttle",
+      intervalMinutes: 5,
+      activatedAt: "2026-04-18T10:00:00.000Z",
+      lastSummaryAt: null,
+      pendingUserTurnSince: null,
+    });
 
-    const disabled = setChatMuted(config, "telegram:100", false);
-    expect(disabled).toBe(true);
-    expect(getChatMuted(config, "telegram:100")).toBe(false);
+    const cleared = clearChatDeliveryPreference(config, "telegram:100");
+    expect(cleared).toBe(true);
+    expect(getChatDeliveryPreference(config, "telegram:100")).toEqual({ mode: "immediate" });
   });
 
-  it("keeps chat preference when unmuting if output settings are customized", () => {
+  it("stores timed and permanent mute delivery", () => {
     const config = makeConfig({ telegram: makeChannel("telegram") });
-    setChatMuted(config, "telegram:100", true);
+    const timed = createTimedMuteDeliveryPreference(30, "2026-04-18T10:00:00.000Z");
+    expect(setChatDeliveryPreference(config, "telegram:100", timed)).toBe(true);
+    expect(isChatDeliveryMuted(config, "telegram:100")).toBe(true);
+    expect(getChatDeliveryPreference(config, "telegram:100")).toEqual({
+      mode: "mute",
+      kind: "timed",
+      activatedAt: "2026-04-18T10:00:00.000Z",
+      mutedUntil: "2026-04-18T10:30:00.000Z",
+      pendingUserTurnSince: null,
+    });
+
+    const permanent = createPermanentMuteDeliveryPreference("2026-04-18T11:00:00.000Z");
+    expect(setChatDeliveryPreference(config, "telegram:100", permanent)).toBe(true);
+    expect(getChatDeliveryPreference(config, "telegram:100")).toEqual({
+      mode: "mute",
+      kind: "permanent",
+      activatedAt: "2026-04-18T11:00:00.000Z",
+      pendingUserTurnSince: null,
+      lastAwaitingUserNoticeAt: null,
+    });
+  });
+
+  it("migrates legacy muted preferences into canonical delivery state", () => {
+    const normalized = normalizeStoredChatPreference({
+      muted: true,
+      output: { typingIndicator: false },
+    }, "2026-04-18T12:00:00.000Z");
+
+    expect(normalized).toEqual({
+      output: { typingIndicator: false },
+      delivery: {
+        mode: "mute",
+        kind: "permanent",
+        activatedAt: "2026-04-18T12:00:00.000Z",
+        pendingUserTurnSince: null,
+        lastAwaitingUserNoticeAt: null,
+      },
+    });
+  });
+
+  it("keeps output preferences when delivery returns to immediate", () => {
+    const config = makeConfig({ telegram: makeChannel("telegram") });
+    setChatDeliveryPreference(
+      config,
+      "telegram:100",
+      createPermanentMuteDeliveryPreference("2026-04-18T12:00:00.000Z")
+    );
     setChatOutputPreferences(config, "telegram:100", {
       ...DEFAULT_CHAT_OUTPUT_PREFERENCES,
       typingIndicator: false,
     });
-    const changed = setChatMuted(config, "telegram:100", false);
+
+    const changed = clearChatDeliveryPreference(config, "telegram:100");
     expect(changed).toBe(true);
-    expect(getChatMuted(config, "telegram:100")).toBe(false);
+    expect(getChatDeliveryPreference(config, "telegram:100")).toEqual({ mode: "immediate" });
     expect(getChatOutputPreferences(config, "telegram:100").typingIndicator).toBe(false);
     expect(config.chatPreferences?.["telegram:100"]).toBeDefined();
   });

@@ -5,7 +5,7 @@ import type { SessionManager } from "../session/manager";
 import { isUserPaired } from "../security/allowlist";
 import {
   addLinkedGroup,
-  getChatMuted,
+  isChatDeliveryMuted,
   isLinkedGroup,
   removeLinkedGroup,
   updateLinkedGroupTitle,
@@ -21,7 +21,7 @@ import { handleNameCommand } from "./handlers/name";
 import { handleOutputModeCommand } from "./handlers/output-mode";
 import type { BackgroundJobSessionSummary } from "./handlers/background-jobs";
 import { handleSkillsCommand } from "./handlers/skills";
-import { handleMuteCommand } from "./handlers/mute";
+import { handleMuteCommand, handleThrottleCommand, handleUnmuteCommand } from "./handlers/mute";
 import { handleStartRemoteControl, handleStopRemoteControl } from "./handlers/remote-control";
 import { logger } from "../daemon/logger";
 import { notifyApp } from "../daemon/notify-app";
@@ -84,8 +84,8 @@ export async function routeMessage(
     else if (rest === " output_mode" || rest.startsWith(" output_mode ")) text = `/output_mode${rest.slice(" output_mode".length)}`;
     else if (rest === " output-mode" || rest.startsWith(" output-mode ")) text = `/output_mode${rest.slice(" output-mode".length)}`;
     else if (rest === " throttle" || rest.startsWith(" throttle ")) text = `/throttle${rest.slice(" throttle".length)}`;
-    else if (rest === " mute") text = "/mute";
-    else if (rest === " unmute") text = "/unmute";
+    else if (rest === " mute" || rest.startsWith(" mute ")) text = `/mute${rest.slice(" mute".length)}`;
+    else if (rest === " unmute" || rest.startsWith(" unmute ")) text = `/unmute${rest.slice(" unmute".length)}`;
     else if (rest === " skills") text = "/skills";
     else if (rest === " link" || rest.startsWith(" link ")) text = `/link${rest.slice(" link".length)}`;
     else if (rest === " unlink") text = "/unlink";
@@ -102,7 +102,7 @@ export async function routeMessage(
   const linked = isLinkedGroup(ctx.config, chatId, channelName);
   const paired = isUserPaired(ctx.config, userId);
   const hasActiveSession = !!ctx.sessionManager.getAttachedRemote(chatId);
-  const isMuted = getChatMuted(ctx.config, chatId);
+  const isMuted = isChatDeliveryMuted(ctx.config, chatId);
 
   syncCommandMenuAsync(ctx, {
     userId,
@@ -131,7 +131,7 @@ export async function routeMessage(
       isGroup,
       isLinkedGroup: isLinkedGroup(ctx.config, chatId, channelName),
       hasActiveSession: !!ctx.sessionManager.getAttachedRemote(chatId),
-      isMuted: getChatMuted(ctx.config, chatId),
+      isMuted: isChatDeliveryMuted(ctx.config, chatId),
     });
     return;
   }
@@ -161,8 +161,9 @@ export async function routeMessage(
     return;
   }
 
-  if (text === "/mute" || text === "/unmute") {
-    await handleMuteCommand({ ...msg, text }, text === "/mute", ctx);
+  if (text === "/throttle" || text.startsWith("/throttle ")) {
+    const throttleArg = text.slice("/throttle".length).trim() || undefined;
+    await handleThrottleCommand({ ...msg, text }, throttleArg, ctx);
     syncCommandMenuAsync(ctx, {
       userId,
       chatId,
@@ -170,13 +171,42 @@ export async function routeMessage(
       isGroup,
       isLinkedGroup: linked,
       hasActiveSession: !!ctx.sessionManager.getAttachedRemote(chatId),
-      isMuted: getChatMuted(ctx.config, chatId),
+      isMuted: isChatDeliveryMuted(ctx.config, chatId),
     });
     return;
   }
 
-  if (text.startsWith("/mute ") || text.startsWith("/unmute ")) {
-    await ctx.channel.send(chatId, `Use ${fmt.code("/mute")} or ${fmt.code("/unmute")} with no arguments.`);
+  if (text === "/mute" || text.startsWith("/mute ")) {
+    const muteArg = text.slice("/mute".length).trim() || undefined;
+    await handleMuteCommand({ ...msg, text }, muteArg, ctx);
+    syncCommandMenuAsync(ctx, {
+      userId,
+      chatId,
+      isPaired: paired,
+      isGroup,
+      isLinkedGroup: linked,
+      hasActiveSession: !!ctx.sessionManager.getAttachedRemote(chatId),
+      isMuted: isChatDeliveryMuted(ctx.config, chatId),
+    });
+    return;
+  }
+
+  if (text === "/unmute") {
+    await handleUnmuteCommand({ ...msg, text }, ctx);
+    syncCommandMenuAsync(ctx, {
+      userId,
+      chatId,
+      isPaired: paired,
+      isGroup,
+      isLinkedGroup: linked,
+      hasActiveSession: !!ctx.sessionManager.getAttachedRemote(chatId),
+      isMuted: isChatDeliveryMuted(ctx.config, chatId),
+    });
+    return;
+  }
+
+  if (text.startsWith("/unmute ")) {
+    await ctx.channel.send(chatId, `Use ${fmt.code("/unmute")} with no arguments.`);
     return;
   }
 
@@ -275,7 +305,7 @@ export async function routeMessage(
       isGroup,
       isLinkedGroup: linked,
       hasActiveSession: !!ctx.sessionManager.getAttachedRemote(chatId),
-      isMuted: getChatMuted(ctx.config, chatId),
+      isMuted: isChatDeliveryMuted(ctx.config, chatId),
     });
     return;
   }
@@ -299,18 +329,14 @@ export async function routeMessage(
     return;
   }
 
-  // /output_mode or /throttle [preset|setting value] — configure Telegram output delivery
+  // /output_mode [preset|setting value] — configure Telegram transcript formatting
   if (
     text === "/output_mode"
     || text === "/output-mode"
     || text.startsWith("/output_mode ")
     || text.startsWith("/output-mode ")
-    || text === "/throttle"
-    || text.startsWith("/throttle ")
   ) {
-    const modeArg = text.startsWith("/throttle")
-      ? text.slice("/throttle".length).trim() || undefined
-      : text.replace(/^\/output(?:_|-)mode/i, "").trim() || undefined;
+    const modeArg = text.replace(/^\/output(?:_|-)mode/i, "").trim() || undefined;
     await handleOutputModeCommand({ ...msg, text }, modeArg, ctx);
     return;
   }
@@ -356,7 +382,7 @@ export async function routeMessage(
         isGroup,
         isLinkedGroup: isLinkedGroup(ctx.config, chatId, channelName),
         hasActiveSession: !!ctx.sessionManager.getAttachedRemote(chatId),
-        isMuted: getChatMuted(ctx.config, chatId),
+        isMuted: isChatDeliveryMuted(ctx.config, chatId),
       });
     } else {
       const added = addLinkedGroup(ctx.config, chatId, msg.chatTitle, channelName);
@@ -374,7 +400,7 @@ export async function routeMessage(
         isGroup,
         isLinkedGroup: isLinkedGroup(ctx.config, chatId, channelName),
         hasActiveSession: !!ctx.sessionManager.getAttachedRemote(chatId),
-        isMuted: getChatMuted(ctx.config, chatId),
+        isMuted: isChatDeliveryMuted(ctx.config, chatId),
       });
     }
     return;
@@ -400,7 +426,7 @@ export async function routeMessage(
       isGroup,
       isLinkedGroup: isLinkedGroup(ctx.config, chatId, channelName),
       hasActiveSession: !!ctx.sessionManager.getAttachedRemote(chatId),
-      isMuted: getChatMuted(ctx.config, chatId),
+      isMuted: isChatDeliveryMuted(ctx.config, chatId),
     });
     return;
   }

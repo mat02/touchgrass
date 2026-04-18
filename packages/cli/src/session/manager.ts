@@ -8,6 +8,8 @@ import type {
   ToolCallMode,
   ToolResultMode,
   TranscriptOutputPreset,
+  ThrottleIntervalMinutes,
+  TimedMuteDurationMinutes,
 } from "../config/schema";
 import { mergeRemoteControlAction, type RemoteControlAction } from "./remote-control";
 
@@ -111,6 +113,30 @@ export interface PendingOutputModePicker {
   options: PendingOutputModeOption[];
   pendingOutput?: ChatOutputPreferences;
 }
+
+export type PendingThrottlePickerOption =
+  | { kind: "preset"; value: ThrottleIntervalMinutes }
+  | { kind: "off" };
+
+export interface PendingThrottlePicker {
+  pollId: string;
+  messageId: string;
+  chatId: ChannelChatId;
+  ownerUserId: ChannelUserId;
+  options: PendingThrottlePickerOption[];
+}
+
+export type PendingMutePickerOption =
+  | { kind: "timed"; value: TimedMuteDurationMinutes }
+  | { kind: "permanent" };
+
+export interface PendingMutePicker {
+  pollId: string;
+  messageId: string;
+  chatId: ChannelChatId;
+  ownerUserId: ChannelUserId;
+  options: PendingMutePickerOption[];
+}
 export interface PendingRecentMessagesPoll {
   sessionId: string;
   chatId: ChannelChatId;
@@ -145,6 +171,10 @@ export class SessionManager {
   private pendingResumePickers: Map<string, PendingResumePicker> = new Map();
   // Map: pollId → pending output mode picker metadata
   private pendingOutputModePickers: Map<string, PendingOutputModePicker> = new Map();
+  // Map: pollId → pending throttle picker metadata
+  private pendingThrottlePickers: Map<string, PendingThrottlePicker> = new Map();
+  // Map: pollId → pending mute picker metadata
+  private pendingMutePickers: Map<string, PendingMutePicker> = new Map();
   // Map: pollId → pending remote control picker metadata
   private pendingRemoteControlPickers: Map<string, PendingRemoteControlPicker> = new Map();
   // Map: pollId → pending "load recent messages?" poll metadata
@@ -256,6 +286,8 @@ export class SessionManager {
     this.pendingFilePickers.clear();
     this.pendingResumePickers.clear();
     this.pendingOutputModePickers.clear();
+    this.pendingThrottlePickers.clear();
+    this.pendingMutePickers.clear();
     this.pendingRemoteControlPickers.clear();
     this.pendingRecentMessagesPolls.clear();
     this.pendingFileMentions.clear();
@@ -438,6 +470,30 @@ export class SessionManager {
     this.pendingOutputModePickers.delete(pollId);
   }
 
+
+  registerThrottlePicker(picker: PendingThrottlePicker): void {
+    this.pendingThrottlePickers.set(picker.pollId, picker);
+  }
+
+  getThrottlePickerByPollId(pollId: string): PendingThrottlePicker | undefined {
+    return this.pendingThrottlePickers.get(pollId);
+  }
+
+  removeThrottlePicker(pollId: string): void {
+    this.pendingThrottlePickers.delete(pollId);
+  }
+
+  registerMutePicker(picker: PendingMutePicker): void {
+    this.pendingMutePickers.set(picker.pollId, picker);
+  }
+
+  getMutePickerByPollId(pollId: string): PendingMutePicker | undefined {
+    return this.pendingMutePickers.get(pollId);
+  }
+
+  removeMutePicker(pollId: string): void {
+    this.pendingMutePickers.delete(pollId);
+  }
   registerRemoteControlPicker(picker: PendingRemoteControlPicker): void {
     this.pendingRemoteControlPickers.set(picker.pollId, picker);
   }

@@ -3,6 +3,8 @@ import { mkdirSync, readFileSync, rmSync, writeFileSync } from "fs";
 import { paths } from "../config/paths";
 import {
   createDefaultConfig,
+  createThrottleDeliveryPreference,
+  getChatDeliveryPreference,
   DEFAULT_CHAT_OUTPUT_PREFERENCES,
   getChatOutputPreferences,
   type TgConfig,
@@ -87,6 +89,89 @@ describe("config store", () => {
       const output = getChatOutputPreferences(loaded, CHAT_ID);
       expect(output.toolResultMode).toBe("full");
       expect(output.orderingNotices).toBe(false);
+    } finally {
+      resetConfigStorage();
+    }
+  });
+
+  it("persists canonical delivery preferences", async () => {
+    resetConfigStorage();
+    try {
+      const config = createDefaultConfig();
+      config.chatPreferences = {
+        [CHAT_ID]: {
+          delivery: createThrottleDeliveryPreference(15, "2026-04-18T10:00:00.000Z"),
+        },
+      };
+
+      await saveConfig(config);
+      invalidateCache();
+
+      const loaded = await loadConfig();
+      expect(getChatDeliveryPreference(loaded, CHAT_ID)).toEqual({
+        mode: "throttle",
+        intervalMinutes: 15,
+        activatedAt: "2026-04-18T10:00:00.000Z",
+        lastSummaryAt: null,
+        pendingUserTurnSince: null,
+      });
+
+      const diskConfig = JSON.parse(readFileSync(paths.config, "utf-8")) as TgConfig;
+      expect(diskConfig.chatPreferences?.[CHAT_ID]?.delivery).toEqual({
+        mode: "throttle",
+        intervalMinutes: 15,
+        activatedAt: "2026-04-18T10:00:00.000Z",
+        lastSummaryAt: null,
+        pendingUserTurnSince: null,
+      });
+    } finally {
+      resetConfigStorage();
+    }
+  });
+
+  it("migrates legacy muted preferences into permanent mute delivery", async () => {
+    resetConfigStorage();
+    try {
+      writeRawConfig({
+        ...createDefaultConfig(),
+        chatPreferences: {
+          [CHAT_ID]: {
+            muted: true,
+            output: { typingIndicator: false },
+          } as any,
+        },
+      } as TgConfig);
+
+      const loaded = await loadConfig();
+      expect(getChatDeliveryPreference(loaded, CHAT_ID)).toEqual({
+        mode: "mute",
+        kind: "permanent",
+        activatedAt: expect.any(String),
+        pendingUserTurnSince: null,
+        lastAwaitingUserNoticeAt: null,
+      });
+      expect(getChatOutputPreferences(loaded, CHAT_ID).typingIndicator).toBe(false);
+    } finally {
+      resetConfigStorage();
+    }
+  });
+
+  it("drops invalid delivery state while preserving valid output settings", async () => {
+    resetConfigStorage();
+    try {
+      writeRawConfig({
+        ...createDefaultConfig(),
+        chatPreferences: {
+          [CHAT_ID]: {
+            output: { toolCallMode: "detailed" },
+            delivery: { mode: "mute", kind: "timed", activatedAt: "bad", mutedUntil: "also-bad" },
+          } as any,
+        },
+      } as TgConfig);
+
+      const loaded = await loadConfig();
+      expect(getChatDeliveryPreference(loaded, CHAT_ID)).toEqual({ mode: "immediate" });
+      expect(getChatOutputPreferences(loaded, CHAT_ID).toolCallMode).toBe("detailed");
     } finally {
       resetConfigStorage();
     }

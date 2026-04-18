@@ -4,13 +4,19 @@ import {
   applyChatTranscriptPreset,
   getAllLinkedGroups,
   getAllPairedUsers,
-  getChatMuted,
+  getChatDeliveryPreference,
   getChatOutputPreferences,
   getTelegramBotToken,
+  isChatDeliveryMuted,
   isLinkedGroup,
   removeLinkedGroup,
+  setChatDeliveryPreference,
   setChatOutputPreferences,
+  type ChatDeliveryPreference,
   type ChatOutputPreferences,
+  type PermanentMuteDeliveryPreference,
+  type ThrottleDeliveryPreference,
+  type TimedMuteDeliveryPreference,
 } from "../config/schema";
 import { TelegramApi } from "../channels/telegram/api";
 import { logger } from "./logger";
@@ -33,6 +39,12 @@ import {
   buildOutputPickerPrompt,
   getNextOutputWizardStep,
 } from "../bot/handlers/output-mode";
+import {
+  buildMutePickerPrompt,
+  buildMuteSummaryMessage,
+  buildThrottlePickerPrompt,
+  buildThrottleSummaryMessage,
+} from "../bot/handlers/mute";
 import type { BackgroundJobSessionSummary } from "../bot/handlers/background-jobs";
 import { SessionManager } from "../session/manager";
 import { formatSimpleToolResult, formatToolCall } from "./tool-display";
@@ -134,6 +146,150 @@ function buildRecentActivityReplayMessages(
 
   const assistantMessage = `${fmt.escape("🤖")} ${fmt.bold("[Assistant]")} ${fmt.escape(lastAssistantEntry.text)}`;
   return { summaryMessage, assistantMessage };
+
+}
+
+const DELIVERY_BUFFER_ENTRY_LIMIT = 24;
+const DELIVERY_BUFFER_MAX_AGE_MS = 2 * 60 * 60_000;
+const DELIVERY_SUMMARY_LIMIT = 6;
+const DELIVERY_REPLAY_COUNT = 3;
+const DELIVERY_SWEEP_INTERVAL_MS = 5_000;
+const PERMANENT_MUTE_AWAITING_USER_DELAY_MS = 60 * 60_000;
+
+interface BufferedDeliveryEntry {
+  at: number;
+  role: DisplayEntry["role"];
+  summaryText: string | null;
+  fullMessage: string | null;
+  countsForSummary: boolean;
+  countsForReplay: boolean;
+}
+
+interface ChatDeliveryRuntimeState {
+  entries: BufferedDeliveryEntry[];
+  lastBufferedAt: number | null;
+  lastFlushAt: number | null;
+}
+
+function isThrottleDeliveryPreference(
+  delivery: ChatDeliveryPreference
+): delivery is ThrottleDeliveryPreference {
+  return delivery.mode === "throttle";
+}
+
+function isTimedMuteDeliveryPreference(
+  delivery: ChatDeliveryPreference
+): delivery is TimedMuteDeliveryPreference {
+  return delivery.mode === "mute" && delivery.kind === "timed";
+}
+
+function isPermanentMuteDeliveryPreference(
+  delivery: ChatDeliveryPreference
+): delivery is PermanentMuteDeliveryPreference {
+  return delivery.mode === "mute" && delivery.kind === "permanent";
+}
+
+function truncateDeliverySummary(text: string, max = 200): string {
+  return text.length > max ? `${text.slice(0, max)}…` : text;
+}
+
+function formatDeliveryMinutes(minutes: number): string {
+  if (minutes === 60) return "1 hour";
+  return `${minutes} minute${minutes === 1 ? "" : "s"}`;
+}
+
+function formatReplayMessage(fmt: Formatter, entry: DisplayEntry): string {
+  const roleLabel = entry.role === "assistant" ? "Assistant" : entry.role === "user" ? "User" : "Tool";
+  const emoji = entry.role === "assistant" ? "🤖" : entry.role === "user" ? "🙋" : "🛠️";
+  return `${fmt.escape(emoji)} ${fmt.bold(`[${roleLabel}]`)} ${fmt.escape(entry.text)}`;
+}
+
+function buildSummaryMessageFromDisplayEntries(fmt: Formatter, entries: DisplayEntry[]): string | null {
+  if (entries.length === 0) return null;
+  return `${fmt.escape("📋")} Recent activity:\n\n${entries.map((entry) => {
+    const roleLabel = entry.role === "assistant" ? "Assistant" : entry.role === "user" ? "User" : "Tool";
+    return `${fmt.bold(`[${roleLabel}]`)} ${fmt.escape(truncateDeliverySummary(entry.text))}`;
+  }).join("\n")}`;
+}
+
+function selectReplayDisplayEntries(
+  entries: DisplayEntry[],
+  lastAssistantEntry: DisplayEntry | null,
+  count: number
+): DisplayEntry[] {
+  const selected: DisplayEntry[] = [];
+  if (lastAssistantEntry) selected.push(lastAssistantEntry);
+  for (let i = entries.length - 1; i >= 0 && selected.length < count; i--) {
+    const candidate = entries[i];
+    if (!candidate) continue;
+    if (selected.some((entry) => entry.role === candidate.role && entry.text === candidate.text)) continue;
+    selected.push(candidate);
+  }
+  return selected.reverse();
+}
+
+function buildBufferedSummaryMessage(fmt: Formatter, entries: BufferedDeliveryEntry[]): string | null {
+  const summaryEntries = entries
+    .filter((entry) => entry.countsForSummary && entry.summaryText)
+    .slice(-DELIVERY_SUMMARY_LIMIT);
+  if (summaryEntries.length === 0) return null;
+  return `${fmt.escape("📋")} Recent activity:\n\n${summaryEntries.map((entry) => {
+    const roleLabel = entry.role === "assistant" ? "Assistant" : entry.role === "user" ? "User" : "Tool";
+    return `${fmt.bold(`[${roleLabel}]`)} ${fmt.escape(truncateDeliverySummary(entry.summaryText || ""))}`;
+  }).join("\n")}`;
+}
+
+function selectBufferedReplayEntries(entries: BufferedDeliveryEntry[], count: number): BufferedDeliveryEntry[] {
+  const candidates = entries.filter((entry) => entry.countsForReplay && entry.fullMessage);
+  const latestAssistant = [...candidates].reverse().find((entry) => entry.role === "assistant") || null;
+  const selected: BufferedDeliveryEntry[] = [];
+  if (latestAssistant) selected.push(latestAssistant);
+  for (let i = candidates.length - 1; i >= 0 && selected.length < count; i--) {
+    const candidate = candidates[i];
+    if (!candidate) continue;
+    if (selected.includes(candidate)) continue;
+    selected.push(candidate);
+  }
+  return selected.reverse();
+}
+
+function buildBufferedDeliveryFlush(fmt: Formatter, entries: BufferedDeliveryEntry[]): {
+  summaryMessage: string | null;
+  replayMessages: string[];
+} {
+  return {
+    summaryMessage: buildBufferedSummaryMessage(fmt, entries),
+    replayMessages: selectBufferedReplayEntries(entries, DELIVERY_REPLAY_COUNT)
+      .map((entry) => entry.fullMessage)
+      .filter((entry): entry is string => typeof entry === "string" && entry.length > 0),
+  };
+}
+
+async function readSessionHistoryRaw(sessionId: string): Promise<string | null> {
+  const manifest = readManifests().get(sessionId);
+  if (!manifest?.jsonlFile) return null;
+  try {
+    return await readFile(manifest.jsonlFile, "utf-8");
+  } catch {
+    return null;
+  }
+}
+
+async function buildHistoryDeliveryFlush(
+  fmt: Formatter,
+  sessionId: string
+): Promise<{ summaryMessage: string | null; replayMessages: string[] }> {
+  const raw = await readSessionHistoryRaw(sessionId);
+  if (!raw) return { summaryMessage: null, replayMessages: [] };
+  const { recentEntries, lastAssistantEntry } = collectRecentActivityPreviewFromRaw(
+    raw,
+    Math.max(DELIVERY_SUMMARY_LIMIT, DELIVERY_REPLAY_COUNT + 3)
+  );
+  return {
+    summaryMessage: buildSummaryMessageFromDisplayEntries(fmt, recentEntries.slice(-DELIVERY_SUMMARY_LIMIT)),
+    replayMessages: selectReplayDisplayEntries(recentEntries, lastAssistantEntry, DELIVERY_REPLAY_COUNT)
+      .map((entry) => formatReplayMessage(fmt, entry)),
+  };
 }
 
 
@@ -190,6 +346,7 @@ export const __daemonTestUtils = {
   formatThinkingNotification,
   formatToolResultNotification,
   buildRecentActivityReplayMessages,
+  buildBufferedDeliveryFlush,
 };
 
 type BackgroundJobStatus = "running" | "completed" | "failed" | "killed";
@@ -291,8 +448,47 @@ export async function startDaemon(): Promise<void> {
     return getChannelForChat(chatId)?.fmt || channels[0].channel.fmt;
   };
   const getOutputPreferencesForChat = (chatId: ChannelChatId) => getChatOutputPreferences(config, chatId);
+  const getDeliveryPreferenceForChat = (chatId: ChannelChatId) => getChatDeliveryPreference(config, chatId);
   const isChatMutedForChat = (chatId: ChannelChatId): boolean => {
-    return getChatMuted(config, chatId);
+    return isChatDeliveryMuted(config, chatId);
+  };
+
+  const deliveryRuntime = new Map<string, ChatDeliveryRuntimeState>();
+  const pendingApprovalBySession = new Map<string, { chatId: ChannelChatId; question: string; options: string[] }>();
+
+  const deliveryRuntimeKey = (sessionId: string, chatId: ChannelChatId): string => `${sessionId}|${chatId}`;
+  const getDeliveryRuntimeState = (sessionId: string, chatId: ChannelChatId): ChatDeliveryRuntimeState => {
+    const key = deliveryRuntimeKey(sessionId, chatId);
+    const existing = deliveryRuntime.get(key);
+    if (existing) return existing;
+    const created: ChatDeliveryRuntimeState = {
+      entries: [],
+      lastBufferedAt: null,
+      lastFlushAt: null,
+    };
+    deliveryRuntime.set(key, created);
+    return created;
+  };
+  const pruneDeliveryRuntimeState = (state: ChatDeliveryRuntimeState, now = Date.now()): void => {
+    state.entries = state.entries.filter((entry) => now - entry.at <= DELIVERY_BUFFER_MAX_AGE_MS).slice(-DELIVERY_BUFFER_ENTRY_LIMIT);
+    if (state.entries.length === 0) {
+      state.lastBufferedAt = null;
+    }
+  };
+  const clearDeliveryRuntimeState = (sessionId: string, chatId: ChannelChatId): void => {
+    deliveryRuntime.delete(deliveryRuntimeKey(sessionId, chatId));
+  };
+  const clearDeliveryRuntimeForChat = (chatId: ChannelChatId): void => {
+    for (const key of deliveryRuntime.keys()) {
+      if (key.endsWith(`|${chatId}`)) deliveryRuntime.delete(key);
+    }
+  };
+  const bufferDeliveryEntry = (sessionId: string, chatId: ChannelChatId, entry: BufferedDeliveryEntry | null): void => {
+    if (!entry) return;
+    const state = getDeliveryRuntimeState(sessionId, chatId);
+    state.entries.push(entry);
+    state.lastBufferedAt = entry.at;
+    pruneDeliveryRuntimeState(state, entry.at);
   };
   const sendToChat = (chatId: ChannelChatId, content: string): void => {
     const channel = getChannelForChat(chatId);
@@ -321,7 +517,7 @@ export async function startDaemon(): Promise<void> {
         isGroup,
         isLinkedGroup: isGroup ? isLinkedGroup(config, chatId) : false,
         hasActiveSession: !!sessionManager.getAttachedRemote(chatId),
-        isMuted: getChatMuted(config, chatId),
+        isMuted: isChatDeliveryMuted(config, chatId),
       });
     })().catch(async (error: unknown) => {
       await logger.debug("Failed to sync command menu from daemon lifecycle", {
@@ -398,6 +594,187 @@ export async function startDaemon(): Promise<void> {
     }
     return targets;
   };
+
+  const updateDeliveryPreferenceForChat = async (
+    chatId: ChannelChatId,
+    updater: (current: ChatDeliveryPreference) => ChatDeliveryPreference
+  ): Promise<ChatDeliveryPreference> => {
+    const current = getDeliveryPreferenceForChat(chatId);
+    const next = updater(current);
+    const changed = setChatDeliveryPreference(config, chatId, next);
+    if (changed) await saveConfig(config);
+    return getDeliveryPreferenceForChat(chatId);
+  };
+
+  const buildApprovalQuestionText = (event: Extract<ConversationEvent, { kind: "approvalNeeded" }>): string => {
+    if (event.promptText) {
+      return event.promptText.slice(0, 300);
+    }
+    const detail = (event.input.command as string) || (event.input.file_path as string)
+      || (event.input.pattern as string) || (event.input.query as string)
+      || (event.input.url as string) || (event.input.description as string) || "";
+    const label = detail.length > 200 ? `${detail.slice(0, 200)}...` : detail;
+    return (label ? `${event.name}: ${label}` : event.name).slice(0, 300);
+  };
+
+  const buildBufferedDeliveryEntry = (
+    fmt: Formatter,
+    output: ChatOutputPreferences,
+    cwd: string,
+    event: ConversationEvent
+  ): BufferedDeliveryEntry | null => {
+    const now = Date.now();
+    if (event.kind === "assistant") {
+      const text = event.text.trim();
+      if (!text) return null;
+      return {
+        at: now,
+        role: "assistant",
+        summaryText: text,
+        fullMessage: fmt.fromMarkdown(event.text),
+        countsForSummary: true,
+        countsForReplay: true,
+      };
+    }
+
+    if (event.kind === "thinking") {
+      const message = formatThinkingNotification(fmt, output.thinkingMode, event.text);
+      if (!message) return null;
+      return {
+        at: now,
+        role: "assistant",
+        summaryText: event.text.trim() || null,
+        fullMessage: message,
+        countsForSummary: true,
+        countsForReplay: false,
+      };
+    }
+
+    if (event.kind === "toolCall") {
+      if (output.toolCallMode === "off") return null;
+      const detailMode = output.toolCallMode === "detailed" ? "verbose" : "simple";
+      const fullMessage = formatToolCall(fmt, event.name, event.input, detailMode, cwd);
+      if (!fullMessage) return null;
+      return {
+        at: now,
+        role: "tool",
+        summaryText: event.name,
+        fullMessage,
+        countsForSummary: true,
+        countsForReplay: true,
+      };
+    }
+
+    if (event.kind === "toolResult") {
+      const fullMessage = formatToolResultNotification(fmt, output, event.toolName, event.content, event.isError === true);
+      if (!fullMessage) return null;
+      return {
+        at: now,
+        role: "tool",
+        summaryText: `${event.toolName}${event.isError ? " error" : " result"}: ${truncateDeliverySummary(event.content, 140)}` ,
+        fullMessage,
+        countsForSummary: true,
+        countsForReplay: true,
+      };
+    }
+
+    if (event.kind === "question") {
+      const first = event.questions[0] as Record<string, unknown> | undefined;
+      const questionText = typeof first?.question === "string" ? first.question : "Question";
+      return {
+        at: now,
+        role: "assistant",
+        summaryText: questionText,
+        fullMessage: `${fmt.escape("❓")} ${fmt.bold("[Question]")} ${fmt.escape(questionText)}` ,
+        countsForSummary: true,
+        countsForReplay: true,
+      };
+    }
+
+    if (event.kind === "approvalNeeded") {
+      const questionText = buildApprovalQuestionText(event);
+      return {
+        at: now,
+        role: "assistant",
+        summaryText: `Approval needed: ${questionText}`,
+        fullMessage: `${fmt.escape("⏸")} ${fmt.bold("[Approval]")} ${fmt.escape(questionText)}` ,
+        countsForSummary: true,
+        countsForReplay: true,
+      };
+    }
+
+    if (event.kind === "assistantFile") {
+      return {
+        at: now,
+        role: "assistant",
+        summaryText: event.caption || `Generated file: ${basename(event.filePath)}` ,
+        fullMessage: null,
+        countsForSummary: true,
+        countsForReplay: false,
+      };
+    }
+
+    return null;
+  };
+
+  const flushBufferedDelivery = async (
+    sessionId: string,
+    chatId: ChannelChatId,
+    options?: { timeoutMs?: number; noticeMessage?: string; includeReplay?: boolean }
+  ): Promise<boolean> => {
+    const channel = getChannelForChat(chatId);
+    if (!channel) return false;
+    const fmt = getFormatterForChat(chatId);
+    const state = getDeliveryRuntimeState(sessionId, chatId);
+    pruneDeliveryRuntimeState(state);
+    let flush = state.entries.length > 0
+      ? buildBufferedDeliveryFlush(fmt, state.entries)
+      : { summaryMessage: null, replayMessages: [] };
+    if (!flush.summaryMessage && flush.replayMessages.length === 0) {
+      flush = await buildHistoryDeliveryFlush(fmt, sessionId);
+    }
+    const replayMessages = options?.includeReplay === false
+      ? []
+      : flush.replayMessages.slice(0, DELIVERY_REPLAY_COUNT);
+    const messages = [
+      options?.noticeMessage || null,
+      flush.summaryMessage,
+      ...replayMessages,
+    ].filter((message): message is string => typeof message === "string" && message.length > 0);
+    if (messages.length === 0) return true;
+    try {
+      for (const message of messages) {
+        await channel.send(chatId, message, options?.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : undefined);
+      }
+      state.entries = [];
+      state.lastBufferedAt = null;
+      state.lastFlushAt = Date.now();
+      pruneDeliveryRuntimeState(state);
+      return true;
+    } catch (error) {
+      await logger.warn("Buffered delivery flush failed", {
+        sessionId,
+        chatId,
+        error: (error as Error)?.message ?? String(error),
+      });
+      return false;
+    }
+  };
+
+  const recordMuteUserTurn = async (chatId: ChannelChatId): Promise<void> => {
+    await updateDeliveryPreferenceForChat(chatId, (delivery) => {
+      if (delivery.mode !== "mute" || delivery.pendingUserTurnSince) return delivery;
+      return { ...delivery, pendingUserTurnSince: new Date().toISOString() };
+    });
+  };
+
+  const clearMuteUserTurn = async (chatId: ChannelChatId): Promise<void> => {
+    await updateDeliveryPreferenceForChat(chatId, (delivery) => {
+      if (delivery.mode !== "mute" || delivery.pendingUserTurnSince === null) return delivery;
+      return { ...delivery, pendingUserTurnSince: null };
+    });
+  };
+
   const resolveSessionArtifactPath = async (sessionId: string, filePath: string): Promise<{ filePath: string; defaultCaption: string }> => {
     const remote = sessionManager.getRemote(sessionId);
     if (!remote) throw new Error("Session not found");
@@ -1590,12 +1967,57 @@ export async function startDaemon(): Promise<void> {
     }
   }
 
+  async function sendPendingApprovalPoll(sessionId: string, sendOptions?: { timeoutMs?: number }) {
+    const pending = pendingApprovalBySession.get(sessionId);
+    if (!pending) return;
+    try {
+      const sent = await sendPollToChat(
+        pending.chatId,
+        pending.question,
+        pending.options,
+        false,
+        sendOptions
+      );
+      if (!sent) return;
+      const { pollId, messageId } = sent;
+      sessionManager.registerPoll(pollId, {
+        sessionId,
+        chatId: pending.chatId,
+        messageId,
+        questionIndex: 0,
+        totalQuestions: 1,
+        multiSelect: false,
+        optionCount: pending.options.length,
+        question: pending.question,
+        optionLabels: pending.options,
+      });
+      pendingApprovalBySession.delete(sessionId);
+    } catch (error) {
+      await logger.error("Failed to send approval poll", {
+        sessionId,
+        error: (error as Error)?.message ?? String(error),
+      });
+    }
+  }
+
   const scheduleNextQuestionPoll = createQuestionPollScheduler({
     getPendingQuestions: (sessionId) => sessionManager.getPendingQuestions(sessionId) ?? null,
     isChatMutedForChat,
     enqueueOrderedConversationDelivery,
     sendNextPoll,
   });
+
+  const schedulePendingInteractiveDelivery = (sessionId: string, chatId: ChannelChatId): void => {
+    if (pendingApprovalBySession.get(sessionId)?.chatId === chatId) {
+      enqueueOrderedConversationDelivery(chatId, async (timeoutMs) => {
+        if (isChatMutedForChat(chatId)) return;
+        await sendPendingApprovalPoll(sessionId, { timeoutMs });
+      });
+    }
+    if (sessionManager.getPendingQuestions(sessionId)?.chatId === chatId) {
+      scheduleNextQuestionPoll(sessionId);
+    }
+  };
 
   function buildFilePickerPage(
     files: string[],
@@ -1772,6 +2194,92 @@ export async function startDaemon(): Promise<void> {
         .catch(() => {});
       return;
     }
+
+    const throttlePicker = sessionManager.getThrottlePickerByPollId(answer.pollId);
+    if (throttlePicker) {
+      if (!isUserPaired(config, answer.userId)) {
+        logger.warn("Ignoring throttle picker answer from unpaired user", { userId: answer.userId, pollId: answer.pollId });
+        return;
+      }
+      if (throttlePicker.ownerUserId !== answer.userId) {
+        logger.warn("Ignoring throttle picker answer from non-owner", {
+          userId: answer.userId,
+          pollId: answer.pollId,
+          ownerUserId: throttlePicker.ownerUserId,
+        });
+        return;
+      }
+
+      sessionManager.removeThrottlePicker(answer.pollId);
+      const selectedIdx = answer.optionIds[0];
+      if (!Number.isFinite(selectedIdx)) return;
+      if (selectedIdx < 0 || selectedIdx >= throttlePicker.options.length) return;
+      const selected = throttlePicker.options[selectedIdx];
+      const chatId = throttlePicker.chatId;
+      const activatedAt = new Date().toISOString();
+      const nextDelivery = selected.kind === "off"
+        ? { mode: "immediate" } satisfies ChatDeliveryPreference
+        : {
+            mode: "throttle",
+            intervalMinutes: selected.value,
+            activatedAt,
+            lastSummaryAt: null,
+            pendingUserTurnSince: null,
+          } satisfies ChatDeliveryPreference;
+      const changed = setChatDeliveryPreference(config, chatId, nextDelivery);
+      if (changed) saveConfig(config).catch(() => {});
+      if (nextDelivery.mode !== "immediate") setTypingForChat(chatId, false);
+      else clearDeliveryRuntimeForChat(chatId);
+      closePollForChat(chatId, throttlePicker.messageId, buildThrottleSummaryMessage(chatId, config, getFormatterForChat(chatId)));
+      syncCommandMenuForChat(chatId, throttlePicker.ownerUserId);
+      return;
+    }
+
+    const mutePicker = sessionManager.getMutePickerByPollId(answer.pollId);
+    if (mutePicker) {
+      if (!isUserPaired(config, answer.userId)) {
+        logger.warn("Ignoring mute picker answer from unpaired user", { userId: answer.userId, pollId: answer.pollId });
+        return;
+      }
+      if (mutePicker.ownerUserId !== answer.userId) {
+        logger.warn("Ignoring mute picker answer from non-owner", {
+          userId: answer.userId,
+          pollId: answer.pollId,
+          ownerUserId: mutePicker.ownerUserId,
+        });
+        return;
+      }
+
+      sessionManager.removeMutePicker(answer.pollId);
+      const selectedIdx = answer.optionIds[0];
+      if (!Number.isFinite(selectedIdx)) return;
+      if (selectedIdx < 0 || selectedIdx >= mutePicker.options.length) return;
+      const selected = mutePicker.options[selectedIdx];
+      const chatId = mutePicker.chatId;
+      const activatedAt = new Date().toISOString();
+      const nextDelivery = selected.kind === "permanent"
+        ? {
+            mode: "mute",
+            kind: "permanent",
+            activatedAt,
+            pendingUserTurnSince: null,
+            lastAwaitingUserNoticeAt: null,
+          } satisfies ChatDeliveryPreference
+        : {
+            mode: "mute",
+            kind: "timed",
+            activatedAt,
+            mutedUntil: new Date(Date.now() + selected.value * 60_000).toISOString(),
+            pendingUserTurnSince: null,
+          } satisfies ChatDeliveryPreference;
+      const changed = setChatDeliveryPreference(config, chatId, nextDelivery);
+      if (changed) saveConfig(config).catch(() => {});
+      setTypingForChat(chatId, false);
+      closePollForChat(chatId, mutePicker.messageId, buildMuteSummaryMessage(chatId, config, getFormatterForChat(chatId)));
+      syncCommandMenuForChat(chatId, mutePicker.ownerUserId);
+      return;
+    }
+
 
     const outputModePicker = sessionManager.getOutputModePickerByPollId(answer.pollId);
     if (outputModePicker) {
@@ -2039,12 +2547,105 @@ export async function startDaemon(): Promise<void> {
     }
   }
 
+  async function sweepDeliveryModes(): Promise<void> {
+    const now = Date.now();
+    for (const remote of sessionManager.listRemotes()) {
+      const targets = getConversationTargets(remote.id);
+      for (const chatId of targets) {
+        const delivery = getDeliveryPreferenceForChat(chatId);
+        if (delivery.mode === "immediate") {
+          clearDeliveryRuntimeState(remote.id, chatId);
+          if (!sessionManager.getActivePollForSession(remote.id)) {
+            schedulePendingInteractiveDelivery(remote.id, chatId);
+          }
+          continue;
+        }
+
+        if (isThrottleDeliveryPreference(delivery)) {
+          const lastSummaryAtMs = delivery.lastSummaryAt ? Date.parse(delivery.lastSummaryAt) : Date.parse(delivery.activatedAt);
+          const dueAt = lastSummaryAtMs + delivery.intervalMinutes * 60_000;
+          if (Number.isFinite(dueAt) && now >= dueAt) {
+            enqueueOrderedConversationDelivery(chatId, async (timeoutMs) => {
+              const current = getDeliveryPreferenceForChat(chatId);
+              if (!isThrottleDeliveryPreference(current)) return;
+              const flushed = await flushBufferedDelivery(remote.id, chatId, { timeoutMs, includeReplay: false });
+              if (!flushed) return;
+              await updateDeliveryPreferenceForChat(chatId, (latest) => (
+                isThrottleDeliveryPreference(latest)
+                  ? { ...latest, lastSummaryAt: new Date().toISOString(), pendingUserTurnSince: null }
+                  : latest
+              ));
+            });
+          }
+          continue;
+        }
+
+        if (isTimedMuteDeliveryPreference(delivery)) {
+          const mutedUntilMs = Date.parse(delivery.mutedUntil);
+          if (Number.isFinite(mutedUntilMs) && now >= mutedUntilMs) {
+            enqueueOrderedConversationDelivery(chatId, async (timeoutMs) => {
+              const current = getDeliveryPreferenceForChat(chatId);
+              if (!isTimedMuteDeliveryPreference(current) || Date.parse(current.mutedUntil) > Date.now()) return;
+              const flushed = await flushBufferedDelivery(remote.id, chatId, { timeoutMs });
+              if (!flushed) return;
+              await updateDeliveryPreferenceForChat(chatId, () => ({ mode: "immediate" }));
+              syncCommandMenuForChat(chatId, remote.ownerUserId);
+              schedulePendingInteractiveDelivery(remote.id, chatId);
+              clearDeliveryRuntimeState(remote.id, chatId);
+            });
+          }
+          continue;
+        }
+
+        if (
+          isPermanentMuteDeliveryPreference(delivery)
+          && delivery.pendingUserTurnSince
+          && !delivery.lastAwaitingUserNoticeAt
+          && now - Date.parse(delivery.activatedAt) >= PERMANENT_MUTE_AWAITING_USER_DELAY_MS
+        ) {
+          enqueueOrderedConversationDelivery(chatId, async (timeoutMs) => {
+            const current = getDeliveryPreferenceForChat(chatId);
+            if (
+              !isPermanentMuteDeliveryPreference(current)
+              || !current.pendingUserTurnSince
+              || current.lastAwaitingUserNoticeAt
+              || Date.now() - Date.parse(current.activatedAt) < PERMANENT_MUTE_AWAITING_USER_DELAY_MS
+            ) return;
+            const channel = getChannelForChat(chatId);
+            if (!channel) return;
+            const fmt = getFormatterForChat(chatId);
+            try {
+              await channel.send(
+                chatId,
+                `${fmt.escape("⏸")} ${fmt.escape("This chat is still muted, but the session appears to be waiting for you. Use /unmute to catch up.")}`,
+                { timeoutMs }
+              );
+            } catch {
+              return;
+            }
+            await updateDeliveryPreferenceForChat(chatId, (latest) => (
+              isPermanentMuteDeliveryPreference(latest)
+                ? { ...latest, lastAwaitingUserNoticeAt: new Date().toISOString() }
+                : latest
+            ));
+          });
+        }
+      }
+    }
+  }
+
   // Wire poll answer handler on all channels that support it
   for (const { channel } of channels) {
     if ("onPollAnswer" in channel) {
       channel.onPollAnswer = handlePollAnswer;
     }
   }
+
+  const deliverySweepTimer = setInterval(() => {
+    void sweepDeliveryModes();
+  }, DELIVERY_SWEEP_INTERVAL_MS);
+  void sweepDeliveryModes();
+
 
   // Reap orphaned remote sessions whose CLI crashed without calling /exit
   const REAP_INTERVAL = 60_000;
@@ -2053,6 +2654,10 @@ export async function startDaemon(): Promise<void> {
     const reaped = sessionManager.reapStaleRemotes(REAP_MAX_AGE);
     for (const remote of reaped) {
       reconnectNoticeBySession.delete(remote.id);
+      pendingApprovalBySession.delete(remote.id);
+      for (const key of deliveryRuntime.keys()) {
+        if (key.startsWith(`${remote.id}|`)) deliveryRuntime.delete(key);
+      }
       await clearBackgroundBoards(remote.id);
       await logger.info("Reaped stale remote session", { id: remote.id, command: remote.command });
       const fmt = getFormatterForChat(remote.chatId);
@@ -2070,6 +2675,7 @@ export async function startDaemon(): Promise<void> {
 
   onShutdown(async () => {
     clearInterval(reaperTimer);
+    clearInterval(deliverySweepTimer);
     clearInterval(backgroundBoardRefreshTimer);
     if (persistStatusBoardsTimer) {
       clearTimeout(persistStatusBoardsTimer);
@@ -2453,6 +3059,35 @@ export async function startDaemon(): Promise<void> {
           };
         });
         sessionManager.setPendingQuestions(sessionId, parsed, targetChat);
+        const delivery = getDeliveryPreferenceForChat(targetChat);
+        if (delivery.mode !== "immediate") {
+          bufferDeliveryEntry(
+            sessionId,
+            targetChat,
+            buildBufferedDeliveryEntry(getFormatterForChat(targetChat), getOutputPreferencesForChat(targetChat), remote.cwd, event)
+          );
+        }
+        if (delivery.mode === "mute") {
+          await recordMuteUserTurn(targetChat);
+          setTypingForChat(targetChat, false);
+          return;
+        }
+        if (isThrottleDeliveryPreference(delivery)) {
+          const fmt = getFormatterForChat(targetChat);
+          const noticeMessage = `${fmt.escape("⏳")} ${fmt.escape(`Throttle is still active every ${formatDeliveryMinutes(delivery.intervalMinutes)}. It looks like it's your turn.`)}`;
+          enqueueOrderedConversationDelivery(targetChat, async (timeoutMs) => {
+            const flushed = await flushBufferedDelivery(sessionId, targetChat, { timeoutMs, noticeMessage });
+            if (flushed) {
+              await updateDeliveryPreferenceForChat(targetChat, (current) => (
+                isThrottleDeliveryPreference(current)
+                  ? { ...current, lastSummaryAt: new Date().toISOString(), pendingUserTurnSince: null }
+                  : current
+              ));
+            }
+            scheduleNextQuestionPoll(sessionId);
+          });
+          return;
+        }
         scheduleNextQuestionPoll(sessionId);
         return;
       }
@@ -2463,38 +3098,42 @@ export async function startDaemon(): Promise<void> {
           logger.info("handleConversationEvent approvalNeeded: no bound chat", { sessionId, chatId: remote.chatId });
           return;
         }
-        enqueueOrderedConversationDelivery(targetChat, async (timeoutMs) => {
-          if (isChatMutedForChat(targetChat)) {
-            setTypingForChat(targetChat, false);
-            return;
-          }
-          let question: string;
-          if (event.promptText) {
-            question = event.promptText.slice(0, 300);
-          } else {
-            const detail = (event.input.command as string) || (event.input.file_path as string)
-              || (event.input.pattern as string) || (event.input.query as string)
-              || (event.input.url as string) || (event.input.description as string) || "";
-            const label = detail.length > 200 ? detail.slice(0, 200) + "..." : detail;
-            question = (label ? `${event.name}: ${label}` : event.name).slice(0, 300);
-          }
-          const options = event.pollOptions && event.pollOptions.length >= 2
-            ? event.pollOptions
-            : ["Yes", "Yes, don't ask again", "No"];
-          const sent = await sendPollToChat(targetChat, question, options, false, { timeoutMs });
-          if (!sent) throw new Error("Channel does not support approval polls");
-          const { pollId, messageId } = sent;
-          sessionManager.registerPoll(pollId, {
+        const question = buildApprovalQuestionText(event);
+        const options = event.pollOptions && event.pollOptions.length >= 2
+          ? event.pollOptions
+          : ["Yes", "Yes, don't ask again", "No"];
+        pendingApprovalBySession.set(sessionId, { chatId: targetChat, question, options });
+        const delivery = getDeliveryPreferenceForChat(targetChat);
+        if (delivery.mode !== "immediate") {
+          bufferDeliveryEntry(
             sessionId,
-            chatId: targetChat,
-            messageId,
-            questionIndex: 0,
-            totalQuestions: 1,
-            multiSelect: false,
-            optionCount: 3,
-            question,
-            optionLabels: options,
+            targetChat,
+            buildBufferedDeliveryEntry(getFormatterForChat(targetChat), getOutputPreferencesForChat(targetChat), remote.cwd, event)
+          );
+        }
+        if (delivery.mode === "mute") {
+          await recordMuteUserTurn(targetChat);
+          setTypingForChat(targetChat, false);
+          return;
+        }
+        if (isThrottleDeliveryPreference(delivery)) {
+          const fmt = getFormatterForChat(targetChat);
+          const noticeMessage = `${fmt.escape("⏳")} ${fmt.escape(`Throttle is still active every ${formatDeliveryMinutes(delivery.intervalMinutes)}. It looks like it's your turn.`)}`;
+          enqueueOrderedConversationDelivery(targetChat, async (timeoutMs) => {
+            const flushed = await flushBufferedDelivery(sessionId, targetChat, { timeoutMs, noticeMessage });
+            if (flushed) {
+              await updateDeliveryPreferenceForChat(targetChat, (current) => (
+                isThrottleDeliveryPreference(current)
+                  ? { ...current, lastSummaryAt: new Date().toISOString(), pendingUserTurnSince: null }
+                  : current
+              ));
+            }
+            await sendPendingApprovalPoll(sessionId, { timeoutMs });
           });
+          return;
+        }
+        enqueueOrderedConversationDelivery(targetChat, async (timeoutMs) => {
+          await sendPendingApprovalPoll(sessionId, { timeoutMs });
         });
         return;
       }
@@ -2513,19 +3152,23 @@ export async function startDaemon(): Promise<void> {
           if (!channel) throw new Error(`No channel available for ${cid.split(":")[0]}`);
           const output = getOutputPreferencesForChat(cid);
           const fmt = getFormatterForChat(cid);
+          const delivery = getDeliveryPreferenceForChat(cid);
+
+          if (delivery.mode !== "immediate") {
+            bufferDeliveryEntry(sessionId, cid, buildBufferedDeliveryEntry(fmt, output, remote.cwd, event));
+            if (event.kind === "assistant" || event.kind === "assistantFile") {
+              setTypingForChat(cid, false);
+            }
+            return;
+          }
 
           if (event.kind === "assistant") {
-            if (isChatMutedForChat(cid)) {
-              setTypingForChat(cid, false);
-              return;
-            }
             setTypingForChat(cid, false);
             await channel.send(cid, fmt.fromMarkdown(event.text), { timeoutMs });
             return;
           }
 
           if (event.kind === "thinking") {
-            if (isChatMutedForChat(cid)) return;
             const message = formatThinkingNotification(fmt, output.thinkingMode, event.text);
             if (!message) return;
             await channel.send(cid, message, { timeoutMs });
@@ -2533,7 +3176,7 @@ export async function startDaemon(): Promise<void> {
           }
 
           if (event.kind === "toolCall") {
-            if (isChatMutedForChat(cid) || output.toolCallMode === "off") return;
+            if (output.toolCallMode === "off") return;
             const detailMode = output.toolCallMode === "detailed" ? "verbose" : "simple";
             const html = formatToolCall(fmt, event.name, event.input, detailMode, remote.cwd);
             if (!html) return;
@@ -2543,7 +3186,6 @@ export async function startDaemon(): Promise<void> {
           }
 
           if (event.kind === "toolResult") {
-            if (isChatMutedForChat(cid)) return;
             const message = formatToolResultNotification(fmt, output, event.toolName, event.content, event.isError === true);
             if (!message) return;
             await channel.send(cid, message, { timeoutMs });
@@ -2552,10 +3194,6 @@ export async function startDaemon(): Promise<void> {
           }
 
           if (event.kind === "assistantFile") {
-            if (isChatMutedForChat(cid)) {
-              setTypingForChat(cid, false);
-              return;
-            }
             if (!resolvedArtifact) throw new Error("Resolved artifact path missing");
             if (!channel.sendDocument) throw new Error(`Channel ${cid.split(":")[0]} does not support file sending`);
             setTypingForChat(cid, false);
@@ -2573,7 +3211,7 @@ export async function startDaemon(): Promise<void> {
       if (targets.size === 0) return;
 
       for (const cid of targets) {
-        if (isChatMutedForChat(cid)) {
+        if (getDeliveryPreferenceForChat(cid).mode !== "immediate") {
           if (!active) setTypingForChat(cid, false);
           continue;
         }

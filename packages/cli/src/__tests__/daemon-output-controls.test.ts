@@ -374,4 +374,72 @@ describe("daemon output controls", () => {
     expect(notices).toEqual([{ chatId: "telegram:1", timeoutMs: 1500 }]);
     expect(calls).toEqual(["after-skip"]);
   });
+  it("keeps the latest assistant message in buffered replay output", () => {
+    const flush = __daemonTestUtils.buildBufferedDeliveryFlush(fmt, [
+      {
+        at: 1,
+        role: "tool",
+        summaryText: "Read README.md",
+        fullMessage: "🛠️ <b>[Tool]</b> Read README.md",
+        countsForSummary: true,
+        countsForReplay: true,
+      },
+      {
+        at: 2,
+        role: "user",
+        summaryText: "Please update the docs",
+        fullMessage: "🙋 <b>[User]</b> Please update the docs",
+        countsForSummary: true,
+        countsForReplay: true,
+      },
+      {
+        at: 3,
+        role: "tool",
+        summaryText: "Search results ready",
+        fullMessage: "🛠️ <b>[Tool]</b> Search results ready",
+        countsForSummary: true,
+        countsForReplay: true,
+      },
+      {
+        at: 4,
+        role: "assistant",
+        summaryText: "I need your approval before editing production config",
+        fullMessage: "🤖 <b>[Assistant]</b> I need your approval before editing production config",
+        countsForSummary: true,
+        countsForReplay: true,
+      },
+    ]);
+
+    expect(flush.summaryMessage).toContain("Recent activity");
+    expect(flush.replayMessages).toEqual([
+      "🙋 <b>[User]</b> Please update the docs",
+      "🛠️ <b>[Tool]</b> Search results ready",
+      "🤖 <b>[Assistant]</b> I need your approval before editing production config",
+    ]);
+  });
+
+  it("suppresses question polls while mute is active", async () => {
+    const pendingBySession = new Map<string, { chatId: string }>([["session-1", { chatId: "telegram:1" }]]);
+    let sendCount = 0;
+    const enqueueOrderedConversationDelivery = __daemonTestUtils.createOrderedConversationQueue({
+      getTimeoutMs: () => 1000,
+      logSkip: async () => {},
+      onSkip: async () => {},
+    });
+    const scheduleNextQuestionPoll = __daemonTestUtils.createQuestionPollScheduler({
+      getPendingQuestions: (sessionId) => pendingBySession.get(sessionId) ?? null,
+      isChatMutedForChat: () => true,
+      enqueueOrderedConversationDelivery,
+      sendNextPoll: async () => {
+        sendCount += 1;
+      },
+    });
+
+    scheduleNextQuestionPoll("session-1");
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(sendCount).toBe(0);
+  });
+
 });

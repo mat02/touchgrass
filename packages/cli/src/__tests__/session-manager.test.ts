@@ -371,6 +371,45 @@ describe("output mode picker state", () => {
   });
 });
 
+
+describe("delivery picker state", () => {
+  it("stores and removes pending throttle picker", () => {
+    const mgr = createManager();
+    mgr.registerThrottlePicker({
+      pollId: "throttle-1",
+      messageId: "1",
+      chatId: "telegram:100" as ChannelChatId,
+      ownerUserId: "telegram:100" as ChannelUserId,
+      options: [{ kind: "preset", value: 5 }, { kind: "off" }],
+    });
+
+    expect(mgr.getThrottlePickerByPollId("throttle-1")?.options).toEqual([
+      { kind: "preset", value: 5 },
+      { kind: "off" },
+    ]);
+    mgr.removeThrottlePicker("throttle-1");
+    expect(mgr.getThrottlePickerByPollId("throttle-1")).toBeUndefined();
+  });
+
+  it("stores and removes pending mute picker", () => {
+    const mgr = createManager();
+    mgr.registerMutePicker({
+      pollId: "mute-1",
+      messageId: "2",
+      chatId: "telegram:100" as ChannelChatId,
+      ownerUserId: "telegram:100" as ChannelUserId,
+      options: [{ kind: "timed", value: 30 }, { kind: "permanent" }],
+    });
+
+    expect(mgr.getMutePickerByPollId("mute-1")?.options).toEqual([
+      { kind: "timed", value: 30 },
+      { kind: "permanent" },
+    ]);
+    mgr.removeMutePicker("mute-1");
+    expect(mgr.getMutePickerByPollId("mute-1")).toBeUndefined();
+  });
+});
+
 describe("getBoundChat", () => {
   it("returns the chatId attached to a session", () => {
     const mgr = createManager();

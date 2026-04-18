@@ -154,6 +154,21 @@ describe("Telegram command menus", () => {
     }))).toEqual(["stop_remote_control", "change_session", "session", "name", "throttle", "output_mode", "unmute", "skills"]);
   });
 
+
+  it("uses distinct delivery and formatting descriptions", () => {
+    const commands = __telegramChannelTestUtils.buildCommandMenu({
+      isPaired: true,
+      isGroup: false,
+      isLinkedGroup: false,
+      hasActiveSession: true,
+      isMuted: false,
+    });
+
+    expect(commands.find((command) => command.command === "throttle")?.description).toBe("Timed summary delivery");
+    expect(commands.find((command) => command.command === "mute")?.description).toBe("Timed or permanent silence");
+    expect(commands.find((command) => command.command === "output_mode")?.description).toBe("Transcript formatting");
+  });
+
   it("syncs chat-member command menu and skips duplicate updates", async () => {
     const channel = new TelegramChannel("bot-token");
     const calls: Array<{ commands: string[]; scope: { type: string; chat_id: number; user_id: number } }> = [];

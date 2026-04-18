@@ -30,6 +30,8 @@ export type ToolCallMode = "off" | "compact" | "detailed";
 export type ToolResultMode = "off" | "compact" | "full";
 export type TranscriptOutputPreset = "simple" | "thinking" | "verbose";
 export type TranscriptOutputPresetLabel = TranscriptOutputPreset | "custom";
+export type ThrottleIntervalMinutes = 1 | 5 | 15 | 30;
+export type TimedMuteDurationMinutes = 15 | 30 | 60;
 
 export interface ChatOutputPreferences {
   thinkingMode: ThinkingMode;
@@ -41,9 +43,43 @@ export interface ChatOutputPreferences {
   orderingNotices: boolean;
 }
 
+export type ImmediateDeliveryPreference = {
+  mode: "immediate";
+};
+
+export type ThrottleDeliveryPreference = {
+  mode: "throttle";
+  intervalMinutes: ThrottleIntervalMinutes;
+  activatedAt: string;
+  lastSummaryAt: string | null;
+  pendingUserTurnSince: string | null;
+};
+
+export type TimedMuteDeliveryPreference = {
+  mode: "mute";
+  kind: "timed";
+  activatedAt: string;
+  mutedUntil: string;
+  pendingUserTurnSince: string | null;
+};
+
+export type PermanentMuteDeliveryPreference = {
+  mode: "mute";
+  kind: "permanent";
+  activatedAt: string;
+  pendingUserTurnSince: string | null;
+  lastAwaitingUserNoticeAt: string | null;
+};
+
+export type ChatDeliveryPreference =
+  | ImmediateDeliveryPreference
+  | ThrottleDeliveryPreference
+  | TimedMuteDeliveryPreference
+  | PermanentMuteDeliveryPreference;
+
 export interface ChatPreferences {
   output?: Partial<ChatOutputPreferences>;
-  muted?: boolean;
+  delivery?: ChatDeliveryPreference;
 }
 
 export interface TgSettings {
@@ -54,6 +90,12 @@ export interface TgSettings {
   maxSessions: number;
   defaultShell: string;
 }
+
+export const THROTTLE_INTERVAL_MINUTES = [1, 5, 15, 30] as const satisfies readonly ThrottleIntervalMinutes[];
+export const TIMED_MUTE_DURATION_MINUTES = [15, 30, 60] as const satisfies readonly TimedMuteDurationMinutes[];
+
+const THROTTLE_INTERVAL_SET = new Set<number>(THROTTLE_INTERVAL_MINUTES);
+const TIMED_MUTE_DURATION_SET = new Set<number>(TIMED_MUTE_DURATION_MINUTES);
 
 export const defaultSettings: TgSettings = {
   outputBatchMinMs: 300,
@@ -127,6 +169,14 @@ function isToolResultMode(value: unknown): value is ToolResultMode {
   return value === "off" || value === "compact" || value === "full";
 }
 
+function isIsoTimestamp(value: unknown): value is string {
+  return typeof value === "string" && Number.isFinite(Date.parse(value));
+}
+
+function normalizeTimestamp(value: unknown): string | null {
+  return isIsoTimestamp(value) ? value : null;
+}
+
 function transcriptMatchesPreset(
   output: Pick<ChatOutputPreferences, "thinkingMode" | "toolCallMode" | "toolResultMode" | "toolErrors">,
   preset: TranscriptOutputPreset
@@ -151,6 +201,108 @@ function normalizeStoredOutput(output: Partial<ChatOutputPreferences> | undefine
   if (typeof output.typingIndicator === "boolean") normalized.typingIndicator = output.typingIndicator;
   if (typeof output.orderingNotices === "boolean") normalized.orderingNotices = output.orderingNotices;
   return Object.keys(normalized).length > 0 ? normalized : undefined;
+}
+
+function normalizeStoredDelivery(delivery: unknown): ChatDeliveryPreference | undefined {
+  if (!delivery || typeof delivery !== "object") return undefined;
+  const candidate = delivery as Record<string, unknown>;
+  if (candidate.mode === "immediate") return { mode: "immediate" };
+  if (candidate.mode === "throttle") {
+    const intervalMinutes = candidate.intervalMinutes;
+    const activatedAt = candidate.activatedAt;
+    if (!THROTTLE_INTERVAL_SET.has(intervalMinutes as number) || !isIsoTimestamp(activatedAt)) {
+      return undefined;
+    }
+    return {
+      mode: "throttle",
+      intervalMinutes: intervalMinutes as ThrottleIntervalMinutes,
+      activatedAt,
+      lastSummaryAt: normalizeTimestamp(candidate.lastSummaryAt),
+      pendingUserTurnSince: normalizeTimestamp(candidate.pendingUserTurnSince),
+    };
+  }
+  if (candidate.mode !== "mute" || candidate.kind === undefined) return undefined;
+  if (candidate.kind === "timed") {
+    const activatedAt = candidate.activatedAt;
+    const mutedUntil = candidate.mutedUntil;
+    const durationMinutes = Math.round((Date.parse(mutedUntil as string) - Date.parse(activatedAt as string)) / 60_000);
+    if (!isIsoTimestamp(activatedAt) || !isIsoTimestamp(mutedUntil) || !TIMED_MUTE_DURATION_SET.has(durationMinutes)) {
+      return undefined;
+    }
+    return {
+      mode: "mute",
+      kind: "timed",
+      activatedAt,
+      mutedUntil,
+      pendingUserTurnSince: normalizeTimestamp(candidate.pendingUserTurnSince),
+    };
+  }
+  if (candidate.kind !== "permanent" || !isIsoTimestamp(candidate.activatedAt)) return undefined;
+  return {
+    mode: "mute",
+    kind: "permanent",
+    activatedAt: candidate.activatedAt,
+    pendingUserTurnSince: normalizeTimestamp(candidate.pendingUserTurnSince),
+    lastAwaitingUserNoticeAt: normalizeTimestamp(candidate.lastAwaitingUserNoticeAt),
+  };
+}
+
+export function createThrottleDeliveryPreference(
+  intervalMinutes: ThrottleIntervalMinutes,
+  activatedAt = new Date().toISOString()
+): ThrottleDeliveryPreference {
+  return {
+    mode: "throttle",
+    intervalMinutes,
+    activatedAt,
+    lastSummaryAt: null,
+    pendingUserTurnSince: null,
+  };
+}
+
+export function createTimedMuteDeliveryPreference(
+  durationMinutes: TimedMuteDurationMinutes,
+  activatedAt = new Date().toISOString()
+): TimedMuteDeliveryPreference {
+  return {
+    mode: "mute",
+    kind: "timed",
+    activatedAt,
+    mutedUntil: new Date(Date.parse(activatedAt) + durationMinutes * 60_000).toISOString(),
+    pendingUserTurnSince: null,
+  };
+}
+
+export function createPermanentMuteDeliveryPreference(
+  activatedAt = new Date().toISOString()
+): PermanentMuteDeliveryPreference {
+  return {
+    mode: "mute",
+    kind: "permanent",
+    activatedAt,
+    pendingUserTurnSince: null,
+    lastAwaitingUserNoticeAt: null,
+  };
+}
+
+export function normalizeStoredChatPreference(
+  preference: unknown,
+  legacyMutedActivatedAt = new Date().toISOString()
+): ChatPreferences | undefined {
+  if (!preference || typeof preference !== "object") return undefined;
+  const candidate = preference as {
+    output?: Partial<ChatOutputPreferences>;
+    delivery?: unknown;
+    muted?: unknown;
+  };
+  const output = normalizeStoredOutput(candidate.output);
+  const delivery = normalizeStoredDelivery(candidate.delivery)
+    ?? (candidate.muted === true ? createPermanentMuteDeliveryPreference(legacyMutedActivatedAt) : undefined);
+  if (!output && (!delivery || delivery.mode === "immediate")) return undefined;
+  return {
+    ...(output ? { output } : {}),
+    ...(delivery && delivery.mode !== "immediate" ? { delivery } : {}),
+  };
 }
 
 export function getChatOutputPreferences(config: TgConfig, chatId: string): ChatOutputPreferences {
@@ -184,16 +336,15 @@ export function applyChatTranscriptPreset(config: TgConfig, chatId: string, pres
 }
 
 function pruneChatPreference(config: TgConfig, chatId: string): void {
-  const pref = config.chatPreferences?.[chatId];
+  if (!config.chatPreferences) return;
+  const pref = config.chatPreferences[chatId];
   if (!pref) return;
-  const normalizedOutput = normalizeStoredOutput(pref.output);
-  const hasStoredOutput = !!normalizedOutput;
-  const hasMuted = pref.muted === true;
-  if (!hasStoredOutput && !hasMuted) {
-    delete config.chatPreferences?.[chatId];
+  const normalized = normalizeStoredChatPreference(pref);
+  if (!normalized) {
+    delete config.chatPreferences[chatId];
     return;
   }
-  pref.output = normalizedOutput;
+  config.chatPreferences[chatId] = normalized;
 }
 
 export function setChatOutputPreferences(
@@ -219,19 +370,33 @@ export function setChatOutputPreferences(
   return true;
 }
 
-export function getChatMuted(config: TgConfig, chatId: string): boolean {
-  return config.chatPreferences?.[chatId]?.muted === true;
+export function getChatDeliveryPreference(config: TgConfig, chatId: string): ChatDeliveryPreference {
+  return normalizeStoredDelivery(config.chatPreferences?.[chatId]?.delivery) ?? { mode: "immediate" };
 }
 
-export function setChatMuted(config: TgConfig, chatId: string, enabled: boolean): boolean {
-  if (getChatMuted(config, chatId) === enabled) return false;
+export function isChatDeliveryMuted(config: TgConfig, chatId: string): boolean {
+  return getChatDeliveryPreference(config, chatId).mode === "mute";
+}
+
+export function setChatDeliveryPreference(
+  config: TgConfig,
+  chatId: string,
+  delivery: ChatDeliveryPreference
+): boolean {
+  const current = getChatDeliveryPreference(config, chatId);
+  const next = normalizeStoredDelivery(delivery) ?? { mode: "immediate" };
+  if (JSON.stringify(current) === JSON.stringify(next)) return false;
   if (!config.chatPreferences) config.chatPreferences = {};
   const nextPref: ChatPreferences = { ...(config.chatPreferences[chatId] || {}) };
-  if (enabled) nextPref.muted = true;
-  else delete nextPref.muted;
+  if (next.mode === "immediate") delete nextPref.delivery;
+  else nextPref.delivery = next;
   config.chatPreferences[chatId] = nextPref;
   pruneChatPreference(config, chatId);
   return true;
+}
+
+export function clearChatDeliveryPreference(config: TgConfig, chatId: string): boolean {
+  return setChatDeliveryPreference(config, chatId, { mode: "immediate" });
 }
 
 
