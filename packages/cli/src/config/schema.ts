@@ -38,6 +38,7 @@ export interface ChatOutputPreferences {
   toolErrors: boolean;
   backgroundJobs: boolean;
   typingIndicator: boolean;
+  orderingNotices: boolean;
 }
 
 export interface ChatPreferences {
@@ -49,6 +50,7 @@ export interface TgSettings {
   outputBatchMinMs: number;
   outputBatchMaxMs: number;
   outputBufferMaxChars: number;
+  orderedConversationTimeoutMs: number;
   maxSessions: number;
   defaultShell: string;
 }
@@ -57,6 +59,7 @@ export const defaultSettings: TgSettings = {
   outputBatchMinMs: 300,
   outputBatchMaxMs: 800,
   outputBufferMaxChars: 4096,
+  orderedConversationTimeoutMs: 2000,
   maxSessions: 10,
   defaultShell: process.env.SHELL || "/bin/bash",
 };
@@ -68,6 +71,7 @@ export const DEFAULT_CHAT_OUTPUT_PREFERENCES: ChatOutputPreferences = {
   toolErrors: true,
   backgroundJobs: true,
   typingIndicator: true,
+  orderingNotices: false,
 };
 
 const TRANSCRIPT_PRESET_PREFERENCES: Record<TranscriptOutputPreset, Pick<ChatOutputPreferences, "thinkingMode" | "toolCallMode" | "toolResultMode" | "toolErrors">> = {
@@ -145,6 +149,7 @@ function normalizeStoredOutput(output: Partial<ChatOutputPreferences> | undefine
   if (typeof output.toolErrors === "boolean") normalized.toolErrors = output.toolErrors;
   if (typeof output.backgroundJobs === "boolean") normalized.backgroundJobs = output.backgroundJobs;
   if (typeof output.typingIndicator === "boolean") normalized.typingIndicator = output.typingIndicator;
+  if (typeof output.orderingNotices === "boolean") normalized.orderingNotices = output.orderingNotices;
   return Object.keys(normalized).length > 0 ? normalized : undefined;
 }
 
@@ -207,6 +212,7 @@ export function setChatOutputPreferences(
   if (output.toolErrors !== DEFAULT_CHAT_OUTPUT_PREFERENCES.toolErrors) storedOutput.toolErrors = output.toolErrors;
   if (output.backgroundJobs !== DEFAULT_CHAT_OUTPUT_PREFERENCES.backgroundJobs) storedOutput.backgroundJobs = output.backgroundJobs;
   if (output.typingIndicator !== DEFAULT_CHAT_OUTPUT_PREFERENCES.typingIndicator) storedOutput.typingIndicator = output.typingIndicator;
+  if (output.orderingNotices !== DEFAULT_CHAT_OUTPUT_PREFERENCES.orderingNotices) storedOutput.orderingNotices = output.orderingNotices;
   nextPref.output = Object.keys(storedOutput).length > 0 ? storedOutput : undefined;
   config.chatPreferences[chatId] = nextPref;
   pruneChatPreference(config, chatId);

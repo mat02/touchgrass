@@ -1,6 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import { routeMessage } from "../bot/command-router";
-import { getChatMuted, defaultSettings } from "../config/schema";
+import { advanceOutputWizardSelection, buildOutputPickerPrompt, getNextOutputWizardStep } from "../bot/handlers/output-mode";
+import { getChatMuted, getChatOutputPreferences, setChatOutputPreferences, defaultSettings } from "../config/schema";
 import { SessionManager } from "../session/manager";
 
 const fmt = {
@@ -57,6 +58,7 @@ describe("output mode command", () => {
     expect(sent).toHaveLength(2);
     expect(sent[0]).toContain("Transcript preset: simple");
     expect(sent[0]).toContain("Thinking: preview");
+    expect(sent[0]).toContain("Ordering notices: off");
     expect(sent[1]).toContain("/output_mode tool_calls off|compact|detailed");
   });
 
@@ -82,6 +84,52 @@ describe("output mode command", () => {
     ]);
   });
 
+
+  it("exposes custom wizard progression through ordering notices and persists the final choice", () => {
+    const sequence: string[] = [];
+    const selections = {
+      thinkingMode: "full",
+      toolCallMode: "detailed",
+      toolResultMode: "full",
+      toolErrors: true,
+      backgroundJobs: true,
+      typingIndicator: true,
+      orderingNotices: true,
+    } as const;
+    const ctx = createCtx([]);
+    const chatId = "telegram:100";
+    let step: ReturnType<typeof getNextOutputWizardStep> | "thinkingMode" = "thinkingMode";
+    let pendingOutput = getChatOutputPreferences(ctx.config, chatId);
+
+    while (step) {
+      sequence.push(step);
+      const prompt = buildOutputPickerPrompt(step, pendingOutput);
+      expect(prompt.options.length).toBeGreaterThan(0);
+      expect(prompt.options.every((option) => option.kind === step)).toBe(true);
+      const selected = prompt.options.find(
+        (option) => option.kind === step && option.value === selections[step]
+      ) as Exclude<(typeof prompt.options)[number], { kind: "preset" }> | undefined;
+      expect(selected).toBeDefined();
+      const advanced = advanceOutputWizardSelection(pendingOutput, selected!);
+      pendingOutput = advanced.nextOutput;
+      step = advanced.nextStep;
+    }
+
+    expect(sequence).toEqual([
+      "thinkingMode",
+      "toolCallMode",
+      "toolResultMode",
+      "toolErrors",
+      "backgroundJobs",
+      "typingIndicator",
+      "orderingNotices",
+    ]);
+    const changed = setChatOutputPreferences(ctx.config, chatId, pendingOutput);
+    expect(changed).toBe(true);
+    expect(getChatOutputPreferences(ctx.config, chatId).orderingNotices).toBe(true);
+    expect(getChatOutputPreferences(ctx.config, chatId).toolCallMode).toBe("detailed");
+    expect(getChatOutputPreferences(ctx.config, chatId).toolResultMode).toBe("full");
+  });
   it("accepts tg output-mode alias", async () => {
     const sent: string[] = [];
     const ctx = createCtx(sent);
@@ -162,6 +210,20 @@ describe("output mode command", () => {
     expect(sent).toHaveLength(1);
     expect(sent[0]).toContain("Tool calls: off");
     expect(sent[0]).toContain("Transcript preset: custom");
+  });
+
+  it("accepts ordering notice settings", async () => {
+    const sent: string[] = [];
+    const ctx = createCtx(sent);
+
+    await routeMessage(
+      { userId: "telegram:1", chatId: "telegram:100", text: "/output_mode ordering_notices on" },
+      ctx
+    );
+
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toContain("Ordering notices: on");
+    expect(sent[0]).toContain("Transcript preset: simple");
   });
 
   it("rejects removed messages_only mode", async () => {

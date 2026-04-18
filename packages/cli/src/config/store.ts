@@ -93,6 +93,7 @@ export async function loadConfig(): Promise<TgConfig> {
             toolErrors?: unknown;
             backgroundJobs?: unknown;
             typingIndicator?: unknown;
+            orderingNotices?: unknown;
           } | unknown;
         };
         const muted = rawPref.muted;
@@ -104,17 +105,15 @@ export async function loadConfig(): Promise<TgConfig> {
         const hasNewOutput = rawPref.output && typeof rawPref.output === "object";
         if (hasNewOutput) {
           const output = rawPref.output as Record<string, unknown>;
-          const valid =
-            (output.thinkingMode === undefined || output.thinkingMode === "off" || output.thinkingMode === "preview" || output.thinkingMode === "full") &&
-            (output.toolCallMode === undefined || output.toolCallMode === "off" || output.toolCallMode === "compact" || output.toolCallMode === "detailed") &&
-            (output.toolResultMode === undefined || output.toolResultMode === "off" || output.toolResultMode === "compact" || output.toolResultMode === "full") &&
-            (output.toolErrors === undefined || typeof output.toolErrors === "boolean") &&
-            (output.backgroundJobs === undefined || typeof output.backgroundJobs === "boolean") &&
-            (output.typingIndicator === undefined || typeof output.typingIndicator === "boolean");
-          if (!valid) {
-            delete parsed.chatPreferences[chatId];
-            continue;
-          }
+          const normalizedOutput: Record<string, unknown> = {};
+          if (output.thinkingMode === "off" || output.thinkingMode === "preview" || output.thinkingMode === "full") normalizedOutput.thinkingMode = output.thinkingMode;
+          if (output.toolCallMode === "off" || output.toolCallMode === "compact" || output.toolCallMode === "detailed") normalizedOutput.toolCallMode = output.toolCallMode;
+          if (output.toolResultMode === "off" || output.toolResultMode === "compact" || output.toolResultMode === "full") normalizedOutput.toolResultMode = output.toolResultMode;
+          if (typeof output.toolErrors === "boolean") normalizedOutput.toolErrors = output.toolErrors;
+          if (typeof output.backgroundJobs === "boolean") normalizedOutput.backgroundJobs = output.backgroundJobs;
+          if (typeof output.typingIndicator === "boolean") normalizedOutput.typingIndicator = output.typingIndicator;
+          if (typeof output.orderingNotices === "boolean") normalizedOutput.orderingNotices = output.orderingNotices;
+          rawPref.output = Object.keys(normalizedOutput).length > 0 ? normalizedOutput : undefined;
         } else {
           let migrated = getChatOutputPreferences(parsed as TgConfig, chatId);
           let shouldMigrateLegacy = false;

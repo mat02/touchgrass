@@ -59,12 +59,13 @@ function formatOutputSummary(output: ChatOutputPreferences, preset: TranscriptOu
   const transcript = `Transcript preset: ${formatPresetLabel(preset)}`;
   return [
     transcript,
-    `Thinking: ${output.thinkingMode}` ,
-    `Tool calls: ${output.toolCallMode}` ,
-    `Tool results: ${output.toolResultMode}` ,
-    `Tool errors: ${output.toolErrors ? "on" : "off"}` ,
-    `Background jobs: ${output.backgroundJobs ? "on" : "off"}` ,
-    `Typing indicator: ${output.typingIndicator ? "on" : "off"}` ,
+    `Thinking: ${output.thinkingMode}`,
+    `Tool calls: ${output.toolCallMode}`,
+    `Tool results: ${output.toolResultMode}`,
+    `Tool errors: ${output.toolErrors ? "on" : "off"}`,
+    `Background jobs: ${output.backgroundJobs ? "on" : "off"}`,
+    `Typing indicator: ${output.typingIndicator ? "on" : "off"}`,
+    `Ordering notices: ${output.orderingNotices ? "on" : "off"}`,
   ].join("\n");
 }
 
@@ -78,6 +79,7 @@ function usageText(): string {
     "/output_mode tool_errors on|off",
     "/output_mode background_jobs on|off",
     "/output_mode typing on|off",
+    "/output_mode ordering_notices on|off",
   ].join("\n");
 }
 
@@ -95,6 +97,7 @@ function parseOutputModeArgs(modeArg: string):
   | { kind: "toolErrors"; value: boolean }
   | { kind: "backgroundJobs"; value: boolean }
   | { kind: "typingIndicator"; value: boolean }
+  | { kind: "orderingNotices"; value: boolean }
   | null {
   const parts = modeArg.split(/\s+/).map(normalizeToken).filter(Boolean);
   if (parts.length === 1) {
@@ -128,6 +131,10 @@ function parseOutputModeArgs(modeArg: string):
   if (setting === "typing") {
     const parsed = parseBooleanToken(value);
     return parsed === null ? null : { kind: "typingIndicator", value: parsed };
+  }
+  if (setting === "ordering_notices") {
+    const parsed = parseBooleanToken(value);
+    return parsed === null ? null : { kind: "orderingNotices", value: parsed };
   }
   return null;
 }
@@ -187,6 +194,12 @@ export function buildOutputPickerPrompt(step: PendingOutputModeOption["kind"] | 
         options: BOOLEAN_CHOICES.map((choice) => ({ kind: "typingIndicator", value: choice.value })),
         optionLabels: BOOLEAN_CHOICES.map((choice) => choice.label),
       };
+    case "orderingNotices":
+      return {
+        title: `Ordering notices (current: ${output.orderingNotices ? "on" : "off"})`,
+        options: BOOLEAN_CHOICES.map((choice) => ({ kind: "orderingNotices", value: choice.value })),
+        optionLabels: BOOLEAN_CHOICES.map((choice) => choice.label),
+      };
   }
 }
 
@@ -197,8 +210,18 @@ export function getNextOutputWizardStep(step: Exclude<PendingOutputModeOption["k
     case "toolResultMode": return "toolErrors";
     case "toolErrors": return "backgroundJobs";
     case "backgroundJobs": return "typingIndicator";
-    case "typingIndicator": return null;
+    case "typingIndicator": return "orderingNotices";
+    case "orderingNotices": return null;
   }
+}
+
+export function advanceOutputWizardSelection(
+  current: ChatOutputPreferences,
+  action: Exclude<PendingOutputModeOption, { kind: "preset" }>
+ ): { nextOutput: ChatOutputPreferences; nextStep: Exclude<PendingOutputModeOption["kind"], "preset"> | null } {
+  const nextOutput = { ...current, [action.kind]: action.value };
+  const nextStep = getNextOutputWizardStep(action.kind);
+  return { nextOutput, nextStep };
 }
 
 export function buildOutputModeSummaryMessage(chatId: string, config: RouterContext["config"], fmt: RouterContext["channel"]["fmt"]): string {

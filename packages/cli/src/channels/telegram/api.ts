@@ -166,14 +166,15 @@ export class TelegramApi {
     chatId: number,
     text: string,
     parseMode: "HTML" | "MarkdownV2" | "" = "HTML",
-    messageThreadId?: number
+    messageThreadId?: number,
+    timeoutMs: number = TelegramApi.DEFAULT_TIMEOUT_MS
   ): Promise<TelegramMessage> {
     return this.call<TelegramMessage>("sendMessage", {
       chat_id: chatId,
       text,
       ...(parseMode ? { parse_mode: parseMode } : {}),
       ...(messageThreadId ? { message_thread_id: messageThreadId } : {}),
-    });
+    }, timeoutMs);
   }
 
   async setMyCommands(
@@ -226,7 +227,8 @@ export class TelegramApi {
     options: string[],
     allowsMultipleAnswers = false,
     isAnonymous = false,
-    messageThreadId?: number
+    messageThreadId?: number,
+    timeoutMs: number = TelegramApi.DEFAULT_TIMEOUT_MS
   ): Promise<TelegramMessage> {
     return this.call<TelegramMessage>("sendPoll", {
       chat_id: chatId,
@@ -235,14 +237,15 @@ export class TelegramApi {
       allows_multiple_answers: allowsMultipleAnswers,
       is_anonymous: isAnonymous,
       ...(messageThreadId ? { message_thread_id: messageThreadId } : {}),
-    });
+    }, timeoutMs);
   }
 
   async sendDocument(
     chatId: number,
     filePath: string,
     caption?: string,
-    messageThreadId?: number
+    messageThreadId?: number,
+    timeoutMs: number = TelegramApi.DEFAULT_TIMEOUT_MS
   ): Promise<TelegramMessage> {
     const file = Bun.file(filePath);
     const formData = new FormData();
@@ -252,13 +255,25 @@ export class TelegramApi {
     if (messageThreadId) formData.append("message_thread_id", String(messageThreadId));
 
     const url = `${this.baseUrl}/sendDocument`;
-    const res = await fetch(url, { method: "POST", body: formData });
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    let res: Response;
+    try {
+      res = await fetch(url, { method: "POST", body: formData, signal: controller.signal });
+    } catch (error) {
+      if (error instanceof DOMException && error.name === "AbortError") {
+        throw new Error(`Telegram API sendDocument timed out after ${timeoutMs}ms`);
+      }
+      throw error;
+    } finally {
+      clearTimeout(timer);
+    }
 
     if (res.status === 429) {
       const body = (await res.json()) as ApiResponse<TelegramMessage>;
       const retryAfter = body.parameters?.retry_after ?? 5;
       await Bun.sleep(retryAfter * 1000);
-      return this.sendDocument(chatId, filePath, caption, messageThreadId);
+      return this.sendDocument(chatId, filePath, caption, messageThreadId, timeoutMs);
     }
 
     if (!res.ok) {
@@ -282,7 +297,8 @@ export class TelegramApi {
     chatId: number,
     text: string,
     buttons: TelegramInlineKeyboardButton[][],
-    messageThreadId?: number
+    messageThreadId?: number,
+    timeoutMs: number = TelegramApi.DEFAULT_TIMEOUT_MS
   ): Promise<TelegramMessage> {
     return this.call<TelegramMessage>("sendMessage", {
       chat_id: chatId,
@@ -290,7 +306,7 @@ export class TelegramApi {
       parse_mode: "HTML",
       reply_markup: { inline_keyboard: buttons },
       ...(messageThreadId ? { message_thread_id: messageThreadId } : {}),
-    });
+    }, timeoutMs);
   }
 
   async editMessageReplyMarkup(

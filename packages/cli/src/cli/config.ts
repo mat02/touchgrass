@@ -30,7 +30,7 @@ export async function runConfig(): Promise<void> {
     const value = args[2];
     if (!key || value === undefined) {
       console.error("Usage: touchgrass config set <key> <value>");
-      console.error("Keys: outputBatchMinMs, outputBatchMaxMs, outputBufferMaxChars, maxSessions, defaultShell");
+      console.error("Keys: outputBatchMinMs, outputBatchMaxMs, outputBufferMaxChars, orderedConversationTimeoutMs, maxSessions, defaultShell");
       process.exit(1);
     }
 

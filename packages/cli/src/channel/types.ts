@@ -57,12 +57,16 @@ export type PollAnswerHandler = (answer: {
   optionIds: number[];
 }) => void;
 
+export interface ChannelSendOptions {
+  timeoutMs?: number;
+}
+
 export interface Channel {
   readonly type: string;
   readonly fmt: Formatter;
-  send(chatId: ChannelChatId, html: string): Promise<void>;
+  send(chatId: ChannelChatId, html: string, options?: ChannelSendOptions): Promise<void>;
   sendOutput(chatId: ChannelChatId, rawOutput: string): Promise<void>;
-  sendDocument?(chatId: ChannelChatId, filePath: string, caption?: string): Promise<void>;
+  sendDocument?(chatId: ChannelChatId, filePath: string, caption?: string, options?: ChannelSendOptions): Promise<void>;
   clearLastMessage(chatId: ChannelChatId): void;
   startReceiving(onMessage: (msg: InboundMessage) => Promise<void>): Promise<void>;
   stopReceiving(): void;
@@ -70,7 +74,7 @@ export interface Channel {
   // Callback for permanent send failures (chat deleted, bot removed, etc.)
   onDeadChat?: ((chatId: ChannelChatId, error: Error) => void) | null;
   // Optional capabilities — not all channels support these
-  sendPoll?(chatId: ChannelChatId, question: string, options: string[], multiSelect: boolean): Promise<PollResult>;
+  sendPoll?(chatId: ChannelChatId, question: string, options: string[], multiSelect: boolean, sendOptions?: ChannelSendOptions): Promise<PollResult>;
   closePoll?(chatId: ChannelChatId, messageId: string): Promise<void>;
   editMessage?(chatId: ChannelChatId, messageId: string, html: string): Promise<void>;
   upsertStatusBoard?(

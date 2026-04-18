@@ -51,6 +51,7 @@ export const __cliRunTestUtils = {
   extractApprovalPrompt,
   selectOmpRolloverSessionFile,
   planOmpSessionWatchDecision,
+  watchGeminiSessionFile,
   resetParserState: () => {
     toolUseIdToName.clear();
     toolUseIdToInput.clear();
@@ -515,6 +516,14 @@ interface AssistantArtifactInfo {
   caption?: string;
 }
 
+type ConversationEventInfo =
+  | { kind: "assistant"; text: string }
+  | { kind: "assistantFile"; artifact: AssistantArtifactInfo }
+  | { kind: "thinking"; text: string }
+  | { kind: "question"; questions: unknown[] }
+  | { kind: "toolCall"; call: ToolCallInfo }
+  | { kind: "toolResult"; result: ToolResultInfo };
+
 interface ParsedMessage {
   assistantText: string | null;
   assistantArtifact: AssistantArtifactInfo | null;
@@ -523,6 +532,7 @@ interface ParsedMessage {
   toolCalls: ToolCallInfo[];
   toolResults: ToolResultInfo[];
   backgroundJobEvents: BackgroundJobEventInfo[];
+  conversationEvents: ConversationEventInfo[];
 }
 
 // Map tool_use_id/call_id → tool name so we can label tool_results
@@ -547,9 +557,25 @@ const isToolRejection = (text: string) =>
   text.includes("The user doesn't want to proceed with this tool use");
 
 const EMPTY_PARSED: ParsedMessage = {
-  assistantText: null, assistantArtifact: null, thinking: null, questions: null, toolCalls: [], toolResults: [], backgroundJobEvents: [],
+  assistantText: null,
+  assistantArtifact: null,
+  thinking: null,
+  questions: null,
+  toolCalls: [],
+  toolResults: [],
+  backgroundJobEvents: [],
+  conversationEvents: [],
 };
 
+function buildBufferedConversationEvents(
+  assistantText: string | null,
+  thinking: string | null
+ ): ConversationEventInfo[] {
+  const events: ConversationEventInfo[] = [];
+  if (thinking) events.push({ kind: "thinking", text: thinking });
+  if (assistantText) events.push({ kind: "assistant", text: assistantText });
+  return events;
+}
 function extractTaskNotificationTag(content: string, tag: string): string | undefined {
   const match = content.match(new RegExp(`<${tag}>([\\s\\S]*?)<\\/${tag}>`, "i"));
   return match?.[1]?.trim() || undefined;
@@ -769,7 +795,10 @@ function parseJsonlMessage(msg: Record<string, unknown>, sourceFilePath?: string
     (msg.type === "message" && msg.role === "assistant" && typeof msg.content === "string")
   ) {
     if (msg.type === "message") {
-      return { ...EMPTY_PARSED, assistantText: msg.content };
+      const assistantText = typeof msg.content === "string" ? msg.content.trim() || null : null;
+      return assistantText
+        ? { ...EMPTY_PARSED, assistantText, conversationEvents: [{ kind: "assistant", text: assistantText }] }
+        : EMPTY_PARSED;
     }
     if (msg.type === "tool_use") {
       const name = msg.tool_name as string;
@@ -780,7 +809,8 @@ function parseJsonlMessage(msg: Record<string, unknown>, sourceFilePath?: string
         toolUseIdToInput.set(toolId, input);
       }
       capIdMap();
-      return { ...EMPTY_PARSED, toolCalls: [{ id: toolId, name, input }] };
+      const call = { id: toolId, name, input };
+      return { ...EMPTY_PARSED, toolCalls: [call], conversationEvents: [{ kind: "toolCall", call }] };
     }
     if (msg.type === "tool_result") {
       const toolId = msg.tool_id as string;
@@ -793,7 +823,11 @@ function parseJsonlMessage(msg: Record<string, unknown>, sourceFilePath?: string
       if (content && shouldForwardToolResult) {
         toolResults.push({ toolName: toolName || "unknown", content, isError });
       }
-      return { ...EMPTY_PARSED, toolResults };
+      return {
+        ...EMPTY_PARSED,
+        toolResults,
+        conversationEvents: toolResults.map((result) => ({ kind: "toolResult", result })),
+      };
     }
     return EMPTY_PARSED;
   }
@@ -807,15 +841,36 @@ function parseJsonlMessage(msg: Record<string, unknown>, sourceFilePath?: string
     const thinkings: string[] = [];
     let questions: unknown[] | null = null;
     const toolCalls: ToolCallInfo[] = [];
+    const conversationEvents: ConversationEventInfo[] = [];
+    let pendingText: string[] = [];
+    let pendingThinking: string[] = [];
+    const flushText = () => {
+      const text = pendingText.join("\n").trim();
+      pendingText = [];
+      if (!text) return;
+      texts.push(text);
+      conversationEvents.push({ kind: "assistant", text });
+    };
+    const flushThinking = () => {
+      const text = pendingThinking.join("\n").trim();
+      pendingThinking = [];
+      if (!text) return;
+      thinkings.push(text);
+      conversationEvents.push({ kind: "thinking", text });
+    };
     for (const block of content) {
       switch (block.type) {
         case "text":
-          if (block.text) texts.push(block.text as string);
+          flushThinking();
+          if (typeof block.text === "string") pendingText.push(block.text);
           break;
         case "thinking":
-          if (block.thinking) thinkings.push(block.thinking as string);
+          flushText();
+          if (typeof block.thinking === "string") pendingThinking.push(block.thinking);
           break;
         case "tool_use": {
+          flushText();
+          flushThinking();
           const name = block.name as string;
           if (!name) break;
           const toolId = (block.id as string) || "";
@@ -827,17 +882,22 @@ function parseJsonlMessage(msg: Record<string, unknown>, sourceFilePath?: string
           const questionsFromTool = extractQuestionSetFromToolCall(name, input);
           if (questionsFromTool) {
             questions = questionsFromTool;
+            conversationEvents.push({ kind: "question", questions: questionsFromTool });
           } else {
-            toolCalls.push({ id: toolId, name, input });
+            const call = { id: toolId, name, input };
+            toolCalls.push(call);
+            conversationEvents.push({ kind: "toolCall", call });
           }
           break;
         }
       }
     }
+    flushText();
+    flushThinking();
     capIdMap();
     const assistantText = texts.join("\n").trim() || null;
     const thinking = thinkings.join("\n").trim() || null;
-    return { assistantText, assistantArtifact: null, thinking, questions, toolCalls, toolResults: [], backgroundJobEvents: [] };
+    return { assistantText, assistantArtifact: null, thinking, questions, toolCalls, toolResults: [], backgroundJobEvents: [], conversationEvents };
   }
 
   // Kimi wire.jsonl format — {"timestamp": ..., "message": {"type": "...", "payload": {...}}}
@@ -852,7 +912,16 @@ function parseJsonlMessage(msg: Record<string, unknown>, sourceFilePath?: string
       kimiAssistantTextBuffer.length = 0;
       kimiAssistantThinkingBuffer.length = 0;
       if (!assistantText && !thinking) return EMPTY_PARSED;
-      return { assistantText, assistantArtifact: null, thinking, questions: null, toolCalls: [], toolResults: [], backgroundJobEvents: [] };
+      return {
+        assistantText,
+        assistantArtifact: null,
+        thinking,
+        questions: null,
+        toolCalls: [],
+        toolResults: [],
+        backgroundJobEvents: [],
+        conversationEvents: buildBufferedConversationEvents(assistantText, thinking),
+      };
     }
 
     const payloadPartType = typeof wirePayload.type === "string" ? wirePayload.type : "";
@@ -886,7 +955,8 @@ function parseJsonlMessage(msg: Record<string, unknown>, sourceFilePath?: string
         toolUseIdToInput.set(callId, input);
       }
       capIdMap();
-      return { ...EMPTY_PARSED, toolCalls: [{ id: callId, name, input }] };
+      const call = { id: callId, name, input };
+      return { ...EMPTY_PARSED, toolCalls: [call], conversationEvents: [{ kind: "toolCall", call }] };
     }
 
     if (wireType === "ToolResult") {
@@ -931,7 +1001,12 @@ function parseJsonlMessage(msg: Record<string, unknown>, sourceFilePath?: string
         toolResults.push({ toolName: toolName || "unknown", content, isError });
       }
       if (toolResults.length === 0 && backgroundJobEvents.length === 0) return EMPTY_PARSED;
-      return { ...EMPTY_PARSED, toolResults, backgroundJobEvents };
+      return {
+        ...EMPTY_PARSED,
+        toolResults,
+        backgroundJobEvents,
+        conversationEvents: toolResults.map((result) => ({ kind: "toolResult", result })),
+      };
     }
 
     return EMPTY_PARSED;
@@ -941,7 +1016,7 @@ function parseJsonlMessage(msg: Record<string, unknown>, sourceFilePath?: string
     ? formatOmpModeChange(msg.mode, asRecord(msg.data))
     : null;
   if (modeChange) {
-    return { ...EMPTY_PARSED, assistantText: modeChange };
+    return { ...EMPTY_PARSED, assistantText: modeChange, conversationEvents: [{ kind: "assistant", text: modeChange }] };
   }
 
   // PI / OMP format — role determines assistant vs tool result
@@ -955,15 +1030,36 @@ function parseJsonlMessage(msg: Record<string, unknown>, sourceFilePath?: string
       const thinkings: string[] = [];
       let questions: unknown[] | null = null;
       const toolCalls: ToolCallInfo[] = [];
+      const conversationEvents: ConversationEventInfo[] = [];
+      let pendingText: string[] = [];
+      let pendingThinking: string[] = [];
+      const flushText = () => {
+        const text = pendingText.join("\n").trim();
+        pendingText = [];
+        if (!text) return;
+        texts.push(text);
+        conversationEvents.push({ kind: "assistant", text });
+      };
+      const flushThinking = () => {
+        const text = pendingThinking.join("\n").trim();
+        pendingThinking = [];
+        if (!text) return;
+        thinkings.push(text);
+        conversationEvents.push({ kind: "thinking", text });
+      };
       for (const block of content) {
         switch (block.type) {
           case "text":
-            if (block.text) texts.push(block.text as string);
+            flushThinking();
+            if (typeof block.text === "string") pendingText.push(block.text);
             break;
           case "thinking":
-            if (block.thinking) thinkings.push(block.thinking as string);
+            flushText();
+            if (typeof block.thinking === "string") pendingThinking.push(block.thinking);
             break;
           case "toolCall": {
+            flushText();
+            flushThinking();
             const name = block.name as string;
             if (!name) break;
             const toolId = (block.id as string) || "";
@@ -975,17 +1071,22 @@ function parseJsonlMessage(msg: Record<string, unknown>, sourceFilePath?: string
             const questionsFromTool = extractQuestionSetFromToolCall(name, input);
             if (questionsFromTool) {
               questions = questionsFromTool;
+              conversationEvents.push({ kind: "question", questions: questionsFromTool });
             } else {
-              toolCalls.push({ id: toolId, name, input });
+              const call = { id: toolId, name, input };
+              toolCalls.push(call);
+              conversationEvents.push({ kind: "toolCall", call });
             }
             break;
           }
         }
       }
+      flushText();
+      flushThinking();
       capIdMap();
       const assistantText = texts.join("\n").trim() || null;
       const thinking = thinkings.join("\n").trim() || null;
-      return { assistantText, assistantArtifact: null, thinking, questions, toolCalls, toolResults: [], backgroundJobEvents: [] };
+      return { assistantText, assistantArtifact: null, thinking, questions, toolCalls, toolResults: [], backgroundJobEvents: [], conversationEvents };
     }
 
     if (m.role === "toolResult") {
@@ -1001,14 +1102,21 @@ function parseJsonlMessage(msg: Record<string, unknown>, sourceFilePath?: string
       if (!text) return EMPTY_PARSED;
       if (!isError && toolName === "exit_plan_mode") {
         const planReview = buildOmpPlanReviewOutcome(asRecord(m.details), sourceFilePath);
+        const assistantText = planReview?.text || text;
+        const assistantArtifact = planReview?.artifactPath ? { path: planReview.artifactPath, caption: "Plan review artifact" } : null;
+        const conversationEvents: ConversationEventInfo[] = [];
+        if (assistantText) conversationEvents.push({ kind: "assistant", text: assistantText });
+        if (assistantArtifact) conversationEvents.push({ kind: "assistantFile", artifact: assistantArtifact });
         return {
           ...EMPTY_PARSED,
-          assistantText: planReview?.text || text,
-          assistantArtifact: planReview?.artifactPath ? { path: planReview.artifactPath, caption: "Plan review artifact" } : null,
+          assistantText,
+          assistantArtifact,
+          conversationEvents,
         };
       }
       if (!isError && !FORWARD_RESULT_TOOLS.has(toolName)) return EMPTY_PARSED;
-      return { ...EMPTY_PARSED, toolResults: [{ toolName: toolName || "unknown", content: text, isError }] };
+      const result = { toolName: toolName || "unknown", content: text, isError };
+      return { ...EMPTY_PARSED, toolResults: [result], conversationEvents: [{ kind: "toolResult", result }] };
     }
 
     return EMPTY_PARSED;
@@ -1021,6 +1129,7 @@ function parseJsonlMessage(msg: Record<string, unknown>, sourceFilePath?: string
     const content = m.content as Array<Record<string, unknown>>;
     const toolResults: ToolResultInfo[] = [];
     const backgroundJobEvents: BackgroundJobEventInfo[] = [];
+    const conversationEvents: ConversationEventInfo[] = [];
     const seenBackgroundIds = new Set<string>();
     const rootToolUseResult = msg.toolUseResult as Record<string, unknown> | undefined;
     const rootBackgroundTaskId = typeof rootToolUseResult?.backgroundTaskId === "string"
@@ -1063,7 +1172,9 @@ function parseJsonlMessage(msg: Record<string, unknown>, sourceFilePath?: string
 
       const shouldForwardToolResult = isError || FORWARD_RESULT_TOOLS.has(toolName);
       if (trimmedText && shouldForwardToolResult) {
-        toolResults.push({ toolName: toolName || "unknown", content: trimmedText, isError });
+        const result = { toolName: toolName || "unknown", content: trimmedText, isError };
+        toolResults.push(result);
+        conversationEvents.push({ kind: "toolResult", result });
       }
 
       const startedIdFromText = trimmedText.match(/Command running in background with ID:\s*([A-Za-z0-9_-]+)/i)?.[1];
@@ -1082,7 +1193,7 @@ function parseJsonlMessage(msg: Record<string, unknown>, sourceFilePath?: string
       }
     }
     if (toolResults.length === 0 && backgroundJobEvents.length === 0) return EMPTY_PARSED;
-    return { ...EMPTY_PARSED, toolResults, backgroundJobEvents };
+    return { ...EMPTY_PARSED, toolResults, backgroundJobEvents, conversationEvents };
   }
 
   // Claude queue notifications for background job lifecycle
@@ -1097,7 +1208,7 @@ function parseJsonlMessage(msg: Record<string, unknown>, sourceFilePath?: string
     const summary = extractTaskNotificationTag(content, "summary");
     const outputFile = extractTaskNotificationTag(content, "output-file");
     const urls = extractUrls(content);
-    const commandMatch = summary?.match(/Background command \"([\\s\\S]+?)\" was/i);
+    const commandMatch = summary?.match(/Background command "([\s\S]+?)" was/i);
     const command = commandMatch?.[1];
     let status: BackgroundJobEventInfo["status"] | null = null;
     if (statusRaw === "running" || statusRaw === "started" || statusRaw === "start") status = "running";
@@ -1124,11 +1235,11 @@ function parseJsonlMessage(msg: Record<string, unknown>, sourceFilePath?: string
     if (!payload) return EMPTY_PARSED;
     if (payload.type === "agent_message" && typeof payload.message === "string") {
       const t = (payload.message as string).trim();
-      return t ? { ...EMPTY_PARSED, assistantText: t } : EMPTY_PARSED;
+      return t ? { ...EMPTY_PARSED, assistantText: t, conversationEvents: [{ kind: "assistant", text: t }] } : EMPTY_PARSED;
     }
     if (payload.type === "agent_reasoning" && typeof payload.text === "string") {
       const t = (payload.text as string).trim();
-      return t ? { ...EMPTY_PARSED, thinking: t } : EMPTY_PARSED;
+      return t ? { ...EMPTY_PARSED, thinking: t, conversationEvents: [{ kind: "thinking", text: t }] } : EMPTY_PARSED;
     }
     return EMPTY_PARSED;
   }
@@ -1147,7 +1258,8 @@ function parseJsonlMessage(msg: Record<string, unknown>, sourceFilePath?: string
       }
       if (callId) toolUseIdToInput.set(callId, input);
       capIdMap();
-      return { ...EMPTY_PARSED, toolCalls: [{ id: callId, name: payload.name, input }] };
+      const call = { id: callId, name: payload.name, input };
+      return { ...EMPTY_PARSED, toolCalls: [call], conversationEvents: [{ kind: "toolCall", call }] };
     }
 
     if (payload.type === "custom_tool_call" && typeof payload.name === "string") {
@@ -1158,7 +1270,8 @@ function parseJsonlMessage(msg: Record<string, unknown>, sourceFilePath?: string
         : {};
       if (callId) toolUseIdToInput.set(callId, input);
       capIdMap();
-      return { ...EMPTY_PARSED, toolCalls: [{ id: callId, name: payload.name, input }] };
+      const call = { id: callId, name: payload.name, input };
+      return { ...EMPTY_PARSED, toolCalls: [call], conversationEvents: [{ kind: "toolCall", call }] };
     }
 
     if (payload.type === "function_call_output" || payload.type === "custom_tool_call_output") {
@@ -1216,7 +1329,12 @@ function parseJsonlMessage(msg: Record<string, unknown>, sourceFilePath?: string
       }
 
       if (toolResults.length === 0 && backgroundJobEvents.length === 0) return EMPTY_PARSED;
-      return { ...EMPTY_PARSED, toolResults, backgroundJobEvents };
+      return {
+        ...EMPTY_PARSED,
+        toolResults,
+        backgroundJobEvents,
+        conversationEvents: toolResults.map((result) => ({ kind: "toolResult", result })),
+      };
     }
   }
 
@@ -1294,6 +1412,7 @@ function watchSessionFile(
   onBackgroundJobEvent?: (events: BackgroundJobEventInfo[]) => void,
   onMessageParsed?: (msg: Record<string, unknown>) => void,
   startFromEnd?: boolean,
+  onConversationEvent?: (event: ConversationEventInfo) => void,
 ): FSWatcher {
   // For resumed sessions, skip existing content — only watch new writes
   let byteOffset = 0;
@@ -1364,15 +1483,19 @@ function watchSessionFile(
             const msg = JSON.parse(line);
             if (onMessageParsed) onMessageParsed(msg);
             const parsed = parseJsonlMessage(msg, filePath);
-            if (parsed.assistantText) onAssistant(parsed.assistantText);
-            if (onAssistantFile && parsed.assistantArtifact) onAssistantFile(parsed.assistantArtifact);
-            if (onQuestion && parsed.questions) onQuestion(parsed.questions);
-            if (onToolCall && parsed.toolCalls.length > 0) onToolCall(parsed.toolCalls);
-            if (onToolResult && parsed.toolResults.length > 0) onToolResult(parsed.toolResults);
+            if (onConversationEvent && parsed.conversationEvents.length > 0) {
+              for (const event of parsed.conversationEvents) onConversationEvent(event);
+            } else {
+              if (parsed.assistantText) onAssistant(parsed.assistantText);
+              if (onAssistantFile && parsed.assistantArtifact) onAssistantFile(parsed.assistantArtifact);
+              if (onQuestion && parsed.questions) onQuestion(parsed.questions);
+              if (onToolCall && parsed.toolCalls.length > 0) onToolCall(parsed.toolCalls);
+              if (onToolResult && parsed.toolResults.length > 0) onToolResult(parsed.toolResults);
+              if (onThinking && parsed.thinking) onThinking(parsed.thinking);
+            }
             if (onBackgroundJobEvent && parsed.backgroundJobEvents.length > 0) {
               onBackgroundJobEvent(parsed.backgroundJobEvents);
             }
-            if (onThinking && parsed.thinking) onThinking(parsed.thinking);
           } catch {} // skip malformed JSONL lines
         }
 
@@ -1412,6 +1535,7 @@ function watchGeminiSessionFile(
   filePath: string,
   onAssistant: (text: string) => void,
   startFromEnd?: boolean,
+  onConversationEvent?: (event: ConversationEventInfo) => void,
 ): FSWatcher {
   let lastProcessedCount = 0;
   let processing = false;
@@ -1451,7 +1575,10 @@ function watchGeminiSessionFile(
           for (let i = lastProcessedCount; i < messages.length; i++) {
             const msg = messages[i];
             if (msg.type === "gemini" && typeof msg.content === "string") {
-              onAssistant(msg.content.trim());
+              const assistantText = msg.content.trim();
+              if (!assistantText) continue;
+              if (onConversationEvent) onConversationEvent({ kind: "assistant", text: assistantText });
+              else onAssistant(assistantText);
             }
           }
           lastProcessedCount = messages.length;
@@ -2323,9 +2450,22 @@ export async function runRun(): Promise<void> {
     let lastNotifiedPrompt = "";
     // Track the last tool call so we can report it when the approval prompt appears
     let lastToolCall: { name: string; input: Record<string, unknown> } | null = null;
-    const onApprovalPrompt = remoteId
+    let remoteConversationQueue = Promise.resolve();
+    const enqueueRemoteConversationEvent = remoteId
+      ? (event: Record<string, unknown>) => {
+          remoteConversationQueue = remoteConversationQueue
+            .catch(() => {})
+            .then(async () => {
+              await daemonRequest(`/remote/${remoteId}/conversation-event`, "POST", event);
+            })
+            .catch(() => {});
+          return remoteConversationQueue;
+        }
+      : null;
+    const onApprovalPrompt = enqueueRemoteConversationEvent
       ? (promptText: string, pollOptions?: string[]) => {
-          daemonRequest(`/remote/${remoteId}/approval-needed`, "POST", {
+          enqueueRemoteConversationEvent({
+            kind: "approvalNeeded",
             name: lastToolCall?.name || "unknown",
             input: lastToolCall?.input || {},
             promptText,
@@ -2450,50 +2590,6 @@ export async function runRun(): Promise<void> {
           manifest.jsonlFile = sessionFile;
           writeManifest(manifest).catch(() => {});
         }
-        const onQuestion = tgRemoteId
-          ? (questions: unknown[]) => {
-              daemonRequest(`/remote/${tgRemoteId}/question`, "POST", { questions }).catch(() => {});
-            }
-          : undefined;
-
-        // Track tool calls for typing indicators and notifications.
-        // Approval detection is handled by the PTY buffer (see APPROVAL_PROMPT_TEXT).
-        const onToolCall = tgRemoteId
-          ? (calls: ToolCallInfo[]) => {
-              // Tool is working — assert typing on all target chats
-              const typingTarget = getPrimaryTargetChat();
-              if (typingTarget) tgChannel.setTyping(typingTarget, true);
-              for (const gid of subscribedGroups) tgChannel.setTyping(gid, true);
-
-              for (const call of calls) {
-                lastToolCall = { name: call.name, input: call.input };
-                // Send tool notification immediately (no poll)
-                daemonRequest(`/remote/${tgRemoteId}/tool-call`, "POST", {
-                  name: call.name,
-                  input: call.input,
-                }).catch(() => {});
-              }
-            }
-          : undefined;
-
-        const onThinking = tgRemoteId
-          ? (text: string) => {
-              daemonRequest(`/remote/${tgRemoteId}/thinking`, "POST", { text }).catch(() => {});
-            }
-          : undefined;
-
-        const onToolResult = tgRemoteId
-          ? (results: ToolResultInfo[]) => {
-              for (const result of results) {
-                daemonRequest(`/remote/${tgRemoteId}/tool-result`, "POST", {
-                  toolName: result.toolName,
-                  content: result.content,
-                  isError: result.isError,
-                }).catch(() => {});
-              }
-            }
-          : undefined;
-
         const onBackgroundJobEvent = tgRemoteId
           ? (events: BackgroundJobEventInfo[]) => {
               for (const event of events) {
@@ -2526,31 +2622,45 @@ export async function runRun(): Promise<void> {
             tgChannel.send(cid, formatted).catch(() => {});
           }
         };
-        const onAssistantFile = tgRemoteId
-          ? (artifact: AssistantArtifactInfo) => {
-              daemonRequest(`/remote/${tgRemoteId}/send-file`, "POST", {
-                filePath: artifact.path,
-                caption: artifact.caption,
-              }).catch(() => {});
+        const onConversationEvent = tgRemoteId && enqueueRemoteConversationEvent
+          ? (event: ConversationEventInfo) => {
+              if (event.kind === "toolCall") {
+                lastToolCall = { name: event.call.name, input: event.call.input };
+                const typingTarget = getPrimaryTargetChat();
+                if (typingTarget) tgChannel.setTyping(typingTarget, true);
+                for (const gid of subscribedGroups) tgChannel.setTyping(gid, true);
+              }
+              if (event.kind === "assistant") lastNotifiedPrompt = "";
+              enqueueRemoteConversationEvent(event.kind === "assistantFile"
+                ? { kind: event.kind, filePath: event.artifact.path, caption: event.artifact.caption }
+                : event.kind === "assistant" || event.kind === "thinking"
+                ? { kind: event.kind, text: event.text }
+                : event.kind === "question"
+                ? { kind: event.kind, questions: event.questions }
+                : event.kind === "toolCall"
+                ? { kind: event.kind, name: event.call.name, input: event.call.input }
+                : { kind: event.kind, toolName: event.result.toolName, content: event.result.content, isError: event.result.isError }
+              ).catch(() => {});
             }
           : undefined;
 
         if (cmdName === "gemini") {
-          watcherRef.current = watchGeminiSessionFile(sessionFile, onAssistant, skipExisting);
+          watcherRef.current = watchGeminiSessionFile(sessionFile, onAssistant, skipExisting, onConversationEvent);
         } else {
           watcherRef.current = watchSessionFile(
             sessionFile,
             onAssistant,
-            onAssistantFile,
-            onQuestion,
-            onToolCall,
-            onThinking,
-            onToolResult,
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            undefined,
             onBackgroundJobEvent,
             (msg) => {
               if (typeof msg.sessionId === "string") activeClaudeSessionId = msg.sessionId;
             },
-            skipExisting
+            skipExisting,
+            onConversationEvent
           );
         }
       };

@@ -5,6 +5,22 @@ import { join } from "path";
 import { __cliRunTestUtils } from "../cli/run";
 
 describe("background job parser", () => {
+  it("parses Gemini assistant JSON into ordered conversation events", () => {
+    __cliRunTestUtils.resetParserState();
+
+    const parsed = __cliRunTestUtils.parseJsonlMessage({
+      type: "message",
+      role: "assistant",
+      content: "  Gemini says hi  ",
+    });
+
+    expect(parsed.assistantText).toBe("Gemini says hi");
+    expect(parsed.conversationEvents).toEqual([
+      { kind: "assistant", text: "Gemini says hi" },
+    ]);
+  });
+
+
   it("extracts running background jobs from Claude tool results", () => {
     __cliRunTestUtils.resetParserState();
 
@@ -401,6 +417,14 @@ describe("background job parser", () => {
         input: { query: "touchgrass omp" },
       },
     ]);
+    expect(assistantParsed.conversationEvents).toEqual([
+      { kind: "thinking", text: "checking workspace" },
+      { kind: "assistant", text: "I found the failing file." },
+      {
+        kind: "toolCall",
+        call: { id: "omp-call-1", name: "web_search", input: { query: "touchgrass omp" } },
+      },
+    ]);
 
     const resultParsed = __cliRunTestUtils.parseJsonlMessage({
       type: "message",
@@ -419,7 +443,35 @@ describe("background job parser", () => {
         isError: false,
       },
     ]);
+    expect(resultParsed.conversationEvents).toEqual([
+      { kind: "toolResult", result: { toolName: "web_search", content: "Result A", isError: false } },
+    ]);
   });
+
+  it("preserves Claude assistant block order in conversation events", () => {
+    __cliRunTestUtils.resetParserState();
+
+    const parsed = __cliRunTestUtils.parseJsonlMessage({
+      type: "assistant",
+      message: {
+        content: [
+          { type: "thinking", thinking: "checking logs" },
+          { type: "text", text: "Found the issue." },
+          { type: "tool_use", id: "toolu_456", name: "WebFetch", input: { url: "https://touchgrass.sh" } },
+        ],
+      },
+    });
+
+    expect(parsed.conversationEvents).toEqual([
+      { kind: "thinking", text: "checking logs" },
+      { kind: "assistant", text: "Found the issue." },
+      {
+        kind: "toolCall",
+        call: { id: "toolu_456", name: "WebFetch", input: { url: "https://touchgrass.sh" } },
+      },
+    ]);
+  });
+
 
   it("extracts OMP ask tool questions as Telegram polls", () => {
     __cliRunTestUtils.resetParserState();
@@ -545,6 +597,10 @@ describe("background job parser", () => {
         path: artifactPath,
         caption: "Plan review artifact",
       });
+      expect(parsed.conversationEvents).toEqual([
+        { kind: "assistant", text: "⛳ Plan ready for approval: LONG_PLAN" },
+        { kind: "assistantFile", artifact: { path: artifactPath, caption: "Plan review artifact" } },
+      ]);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

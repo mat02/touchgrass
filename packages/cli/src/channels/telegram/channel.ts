@@ -7,6 +7,7 @@ import {
 import type {
   Channel,
   ChannelChatId,
+  ChannelSendOptions,
   CommandMenuContext,
   ClearStatusBoardOptions,
   InboundMessage,
@@ -196,11 +197,12 @@ export class TelegramChannel implements Channel {
     }
   }
 
-  async send(chatId: ChannelChatId, html: string): Promise<void> {
+  async send(chatId: ChannelChatId, html: string, options?: ChannelSendOptions): Promise<void> {
     this.setTyping(chatId, false);
     const { chatId: numChatId, threadId } = fromChatId(chatId);
+    const timeoutMs = options?.timeoutMs;
     try {
-      await this.api.sendMessage(numChatId, html, "HTML", threadId);
+      await this.api.sendMessage(numChatId, html, "HTML", threadId, timeoutMs);
       this.lastMessage.delete(chatId);
     } catch (e) {
       const err = e as Error;
@@ -208,7 +210,7 @@ export class TelegramChannel implements Channel {
         await logger.warn("Retrying long Telegram message as plain-text chunks", { chatId });
         try {
           for (const chunk of chunkHtmlForTelegramFallback(html)) {
-            await this.api.sendMessage(numChatId, chunk, "HTML", threadId);
+            await this.api.sendMessage(numChatId, chunk, "HTML", threadId, timeoutMs);
           }
           this.lastMessage.delete(chatId);
           return;
@@ -216,11 +218,13 @@ export class TelegramChannel implements Channel {
           const retryErr = chunkError as Error;
           await logger.error("Failed to send long message chunks", { chatId, error: retryErr.message });
           if (this.isDeadChatError(retryErr.message)) this.onDeadChat?.(chatId, retryErr);
+          if (timeoutMs !== undefined) throw retryErr;
           return;
         }
       }
       await logger.error("Failed to send message", { chatId, error: err.message });
       if (this.isDeadChatError(err.message)) this.onDeadChat?.(chatId, err);
+      if (timeoutMs !== undefined) throw err;
     }
   }
 
@@ -274,14 +278,15 @@ export class TelegramChannel implements Channel {
     }
   }
 
-  async sendDocument(chatId: ChannelChatId, filePath: string, caption?: string): Promise<void> {
+  async sendDocument(chatId: ChannelChatId, filePath: string, caption?: string, options?: ChannelSendOptions): Promise<void> {
     const { chatId: numChatId, threadId } = fromChatId(chatId);
     try {
-      await this.api.sendDocument(numChatId, filePath, caption, threadId);
+      await this.api.sendDocument(numChatId, filePath, caption, threadId, options?.timeoutMs);
     } catch (e) {
       const err = e as Error;
       await logger.error("Failed to send document", { chatId, filePath, error: err.message });
       if (this.isDeadChatError(err.message)) this.onDeadChat?.(chatId, err);
+      if (options?.timeoutMs !== undefined) throw err;
     }
   }
 
@@ -303,9 +308,11 @@ export class TelegramChannel implements Channel {
     chatId: ChannelChatId,
     question: string,
     options: string[],
-    multiSelect: boolean
+    multiSelect: boolean,
+    sendOptions?: ChannelSendOptions
   ): Promise<PollResult> {
     const { chatId: numChatId, threadId } = fromChatId(chatId);
+    const timeoutMs = sendOptions?.timeoutMs;
     if (!multiSelect) {
       const id = actionPollId();
       const inlineButtons: TelegramInlineKeyboardButton[][] = options.slice(0, 10).map((label, idx) => [
@@ -315,13 +322,14 @@ export class TelegramChannel implements Channel {
         numChatId,
         this.fmt.bold(this.fmt.escape(question)),
         inlineButtons,
-        threadId
+        threadId,
+        timeoutMs
       );
       this.actionPollById.set(id, { chatId, messageId: sent.message_id });
       this.actionPollByMessage.set(`${chatId}:${sent.message_id}`, id);
       return { pollId: id, messageId: String(sent.message_id) };
     }
-    const sent = await this.api.sendPoll(numChatId, question, options, multiSelect, false, threadId);
+    const sent = await this.api.sendPoll(numChatId, question, options, multiSelect, false, threadId, timeoutMs);
     // Telegram includes poll info in the sent message
     const poll = (sent as unknown as { poll?: { id: string } }).poll;
     return { pollId: poll?.id ?? "", messageId: String(sent.message_id) };

@@ -25,9 +25,10 @@ import {
   removeSocket,
   writePidFile,
 } from "./lifecycle";
-import { startControlServer, type ChannelInfo, type ConfigChannelSummary, type ConfigChannelDetails } from "./control-server";
+import { startControlServer, type ChannelInfo, type ConfigChannelSummary, type ConfigChannelDetails, type ConversationEvent } from "./control-server";
 import { routeMessage } from "../bot/command-router";
 import {
+  advanceOutputWizardSelection,
   buildOutputModeSummaryMessage,
   buildOutputPickerPrompt,
   getNextOutputWizardStep,
@@ -101,7 +102,56 @@ function formatToolResultNotification(
   return formatSimpleToolResult(fmt, toolName, content, isError);
 }
 
+function createOrderedConversationQueue(deps: {
+  getTimeoutMs: () => number;
+  logSkip: (chatId: ChannelChatId, error: Error) => Promise<void>;
+  onSkip: (chatId: ChannelChatId, timeoutMs: number) => Promise<void>;
+}): (chatId: ChannelChatId, deliver: (timeoutMs: number) => Promise<void>) => void {
+  const queues = new Map<ChannelChatId, Promise<void>>();
+  return (chatId, deliver) => {
+    const previous = queues.get(chatId) ?? Promise.resolve();
+    const current = previous
+      .catch(() => {})
+      .then(async () => {
+        const timeoutMs = deps.getTimeoutMs();
+        try {
+          await deliver(timeoutMs);
+        } catch (error) {
+          const err = error instanceof Error ? error : new Error(String(error));
+          await deps.logSkip(chatId, err);
+          await deps.onSkip(chatId, timeoutMs);
+        }
+      })
+      .finally(() => {
+        if (queues.get(chatId) === current) queues.delete(chatId);
+      });
+    queues.set(chatId, current);
+  };
+}
+
+function createQuestionPollScheduler(deps: {
+  getPendingQuestions: (sessionId: string) => { chatId: ChannelChatId } | null;
+  isChatMutedForChat: (chatId: ChannelChatId) => boolean;
+  enqueueOrderedConversationDelivery: (
+    chatId: ChannelChatId,
+    deliver: (timeoutMs: number) => Promise<void>
+  ) => void;
+  sendNextPoll: (sessionId: string, sendOptions?: { timeoutMs?: number }) => Promise<void>;
+}): (sessionId: string) => void {
+  return (sessionId) => {
+    const pending = deps.getPendingQuestions(sessionId);
+    if (!pending) return;
+    const chatId = pending.chatId;
+    deps.enqueueOrderedConversationDelivery(chatId, async (timeoutMs) => {
+      if (deps.isChatMutedForChat(chatId)) return;
+      await deps.sendNextPoll(sessionId, { timeoutMs });
+    });
+  };
+}
+
 export const __daemonTestUtils = {
+  createOrderedConversationQueue,
+  createQuestionPollScheduler,
   formatThinkingNotification,
   formatToolResultNotification,
 };
@@ -276,11 +326,81 @@ export async function startDaemon(): Promise<void> {
     chatId: ChannelChatId,
     question: string,
     options: string[],
-    multiSelect: boolean
+    multiSelect: boolean,
+    sendOptions?: { timeoutMs?: number }
   ): Promise<{ pollId: string; messageId: string } | null> => {
     const channel = getChannelForChat(chatId);
     if (!channel?.sendPoll) return null;
-    return channel.sendPoll(chatId, question, options, multiSelect);
+    return channel.sendPoll(chatId, question, options, multiSelect, sendOptions);
+  };
+  const enqueueOrderedConversationDelivery = createOrderedConversationQueue({
+    getTimeoutMs: () => Math.max(250, config.settings.orderedConversationTimeoutMs),
+    logSkip: async (chatId, error) => {
+      await logger.warn("Skipping stalled ordered conversation event", {
+        chatId,
+        error: error.message,
+      });
+    },
+    onSkip: async (chatId, timeoutMs) => {
+      const output = getOutputPreferencesForChat(chatId);
+      const channel = getChannelForChat(chatId);
+      if (!output.orderingNotices || !channel) return;
+      const fmt = getFormatterForChat(chatId);
+      await channel
+        .send(chatId, `${fmt.escape("⛳️")} ${fmt.escape("Skipped one bridge event to preserve message order.")}`, { timeoutMs })
+        .catch(() => {});
+    },
+  });
+  const getConversationTargets = (sessionId: string, includeGroups = true): Set<ChannelChatId> => {
+    const targets = new Set<ChannelChatId>();
+    const targetChat = sessionManager.getBoundChat(sessionId);
+    if (targetChat) targets.add(targetChat);
+    if (includeGroups) {
+      for (const groupChatId of sessionManager.getSubscribedGroups(sessionId)) {
+        targets.add(groupChatId);
+      }
+    }
+    return targets;
+  };
+  const resolveSessionArtifactPath = async (sessionId: string, filePath: string): Promise<{ filePath: string; defaultCaption: string }> => {
+    const remote = sessionManager.getRemote(sessionId);
+    if (!remote) throw new Error("Session not found");
+
+    let resolvedPath = filePath;
+    if (remote.cwd && !resolvedPath.startsWith("/")) {
+      resolvedPath = resolve(remote.cwd, resolvedPath);
+    }
+
+    let fileStats;
+    try {
+      fileStats = await stat(resolvedPath);
+    } catch {
+      throw new Error(`File not found: ${resolvedPath}`);
+    }
+    if (!fileStats.isFile()) throw new Error(`Not a file: ${resolvedPath}`);
+    if (fileStats.size <= 0) throw new Error("File is empty");
+    if (fileStats.size > 50 * 1024 * 1024) throw new Error("File exceeds 50MB channel upload limit");
+
+    try {
+      const realFile = await realpath(resolvedPath);
+      const allowedRoots: string[] = [paths.uploadsDir];
+      if (remote.cwd) allowedRoots.push(await realpath(remote.cwd).catch(() => remote.cwd));
+      const manifestJsonl = readSessionManifestSync(sessionId)?.jsonlFile;
+      if (manifestJsonl) {
+        const sessionArtifactRoot = await realpath(resolve(dirname(manifestJsonl), "local")).catch(() => resolve(dirname(manifestJsonl), "local"));
+        allowedRoots.push(sessionArtifactRoot);
+      }
+      const inAllowed = allowedRoots.some((root) => realFile.startsWith(root + "/") || realFile === root);
+      if (!inAllowed) {
+        throw new Error(`File path outside session working directory: ${resolvedPath}`);
+      }
+      resolvedPath = realFile;
+    } catch (error) {
+      if (error instanceof Error) throw error;
+      throw new Error(`Cannot resolve file path: ${resolvedPath}`);
+    }
+
+    return { filePath: resolvedPath, defaultCaption: basename(resolvedPath) };
   };
   const closePollForChat = (chatId: ChannelChatId, messageId: string, confirmText?: string): void => {
     const channel = getChannelForChat(chatId);
@@ -1387,7 +1507,7 @@ export async function startDaemon(): Promise<void> {
 
   // --- Poll / AskUserQuestion support ---
 
-  async function sendNextPoll(sessionId: string) {
+  async function sendNextPoll(sessionId: string, sendOptions?: { timeoutMs?: number }) {
     const pending = sessionManager.getPendingQuestions(sessionId);
     if (!pending) return;
     const idx = pending.currentIndex;
@@ -1412,7 +1532,8 @@ export async function startDaemon(): Promise<void> {
         pending.chatId,
         questionText,
         optionLabels,
-        q.multiSelect
+        q.multiSelect,
+        sendOptions
       );
       if (!sent) return;
       const { pollId, messageId } = sent;
@@ -1432,6 +1553,13 @@ export async function startDaemon(): Promise<void> {
       sessionManager.clearPendingQuestions(sessionId);
     }
   }
+
+  const scheduleNextQuestionPoll = createQuestionPollScheduler({
+    getPendingQuestions: (sessionId) => sessionManager.getPendingQuestions(sessionId) ?? null,
+    isChatMutedForChat,
+    enqueueOrderedConversationDelivery,
+    sendNextPoll,
+  });
 
   function buildFilePickerPage(
     files: string[],
@@ -1661,8 +1789,7 @@ export async function startDaemon(): Promise<void> {
       }
 
       const current = outputModePicker.pendingOutput || getChatOutputPreferences(config, chatId);
-      const nextOutput = { ...current, [selected.kind]: selected.value };
-      const nextStep = getNextOutputWizardStep(selected.kind);
+      const { nextOutput, nextStep } = advanceOutputWizardSelection(current, selected);
       if (!nextStep) {
         const changed = setChatOutputPreferences(config, chatId, nextOutput);
         if (changed) saveConfig(config).catch(() => {});
@@ -1876,7 +2003,7 @@ export async function startDaemon(): Promise<void> {
       if (pending) {
         pending.answers.push(answer.optionIds);
         pending.currentIndex++;
-        sendNextPoll(poll.sessionId);
+        scheduleNextQuestionPoll(poll.sessionId);
       }
     }
   }
@@ -2216,60 +2343,26 @@ export async function startDaemon(): Promise<void> {
       return { ok: true };
     },
     async sendFileToSession(sessionId: string, filePath: string, caption?: string): Promise<{ ok: boolean; error?: string }> {
-      const remote = sessionManager.getRemote(sessionId);
-      if (!remote) return { ok: false, error: "Session not found" };
-
-      // Resolve relative paths against session cwd
-      if (remote.cwd && !filePath.startsWith("/")) {
-        filePath = resolve(remote.cwd, filePath);
-      }
-
-      let fileStats;
       try {
-        fileStats = await stat(filePath);
-      } catch {
-        return { ok: false, error: `File not found: ${filePath}` };
-      }
-      if (!fileStats.isFile()) return { ok: false, error: `Not a file: ${filePath}` };
-      if (fileStats.size <= 0) return { ok: false, error: "File is empty" };
-      if (fileStats.size > 50 * 1024 * 1024) return { ok: false, error: "File exceeds 50MB channel upload limit" };
+        const resolvedArtifact = await resolveSessionArtifactPath(sessionId, filePath);
+        const targets = getConversationTargets(sessionId);
+        if (targets.size === 0) return { ok: false, error: "No bound channel for this session" };
 
-      // Security: restrict file sends to session cwd, uploads directory, and OMP session artifact dir
-      // Use realpath to resolve symlinks and prevent traversal
-      try {
-        const realFile = await realpath(filePath);
-        const allowedRoots: string[] = [paths.uploadsDir];
-        if (remote.cwd) allowedRoots.push(await realpath(remote.cwd).catch(() => remote.cwd));
-        const manifestJsonl = readSessionManifestSync(sessionId)?.jsonlFile;
-        if (manifestJsonl) {
-          const sessionArtifactRoot = await realpath(resolve(dirname(manifestJsonl), "local")).catch(() => resolve(dirname(manifestJsonl), "local"));
-          allowedRoots.push(sessionArtifactRoot);
+        const finalCaption = (caption && caption.trim()) || resolvedArtifact.defaultCaption;
+        for (const cid of targets) {
+          const channel = getChannelForChat(cid);
+          if (!channel) {
+            return { ok: false, error: `No channel available for ${cid.split(":")[0]}` };
+          }
+          if (!channel.sendDocument) {
+            return { ok: false, error: `Channel ${cid.split(":")[0]} does not support file sending` };
+          }
+          await channel.sendDocument(cid, resolvedArtifact.filePath, finalCaption);
         }
-        const inAllowed = allowedRoots.some((root) => realFile.startsWith(root + "/") || realFile === root);
-        if (!inAllowed) {
-          return { ok: false, error: `File path outside session working directory: ${filePath}` };
-        }
-      } catch {
-        return { ok: false, error: `Cannot resolve file path: ${filePath}` };
+        return { ok: true };
+      } catch (error) {
+        return { ok: false, error: (error as Error).message };
       }
-
-      const targets = new Set<ChannelChatId>();
-      const targetChat = sessionManager.getBoundChat(sessionId);
-      if (targetChat) targets.add(targetChat);
-      for (const groupChatId of sessionManager.getSubscribedGroups(sessionId)) {
-        targets.add(groupChatId);
-      }
-      if (targets.size === 0) return { ok: false, error: "No bound channel for this session" };
-
-      const finalCaption = (caption && caption.trim()) || basename(filePath);
-      for (const cid of targets) {
-        const channel = getChannelForChat(cid);
-        if (!channel?.sendDocument) {
-          return { ok: false, error: `Channel ${cid.split(":")[0]} does not support file sending` };
-        }
-        await channel.sendDocument(cid, filePath, finalCaption);
-      }
-      return { ok: true };
     },
     stopSessionById(sessionId: string): { ok: boolean; error?: string } {
       if (sessionManager.requestRemoteStop(sessionId)) {
@@ -2309,69 +2402,56 @@ export async function startDaemon(): Promise<void> {
       }
       return { ok: true, sessionRef: resolvedSessionRef };
     },
-    handleToolCall(sessionId: string, name: string, input: Record<string, unknown>): void {
-      const remote = sessionManager.getRemote(sessionId);
-      if (!remote) return;
-      const targets = new Set<ChannelChatId>();
-      const targetChat = sessionManager.getBoundChat(sessionId);
-      if (targetChat) targets.add(targetChat);
-      for (const groupChatId of sessionManager.getSubscribedGroups(sessionId)) {
-        targets.add(groupChatId);
-      }
-      if (targets.size === 0) return;
-
-      for (const cid of targets) {
-        if (isChatMutedForChat(cid)) continue;
-        const output = getOutputPreferencesForChat(cid);
-        if (output.toolCallMode === "off") continue;
-        const fmt = getFormatterForChat(cid);
-        const detailMode = output.toolCallMode === "detailed" ? "verbose" : "simple";
-        const html = formatToolCall(fmt, name, input, detailMode, remote.cwd);
-        if (!html) continue;
-        sendToChat(cid, html);
-        setTypingForChat(cid, true);
-      }
-    },
-    handleTyping(sessionId: string, active: boolean): void {
+    async handleConversationEvent(sessionId: string, event: ConversationEvent): Promise<void> {
       const remote = sessionManager.getRemote(sessionId);
       if (!remote) return;
 
-      const targets = new Set<ChannelChatId>();
-      const targetChat = sessionManager.getBoundChat(sessionId);
-      if (targetChat) targets.add(targetChat);
-      for (const groupChatId of sessionManager.getSubscribedGroups(sessionId)) {
-        targets.add(groupChatId);
+      if (event.kind === "question") {
+        const targetChat = sessionManager.getBoundChat(sessionId);
+        if (!targetChat) return;
+        const parsed: AskQuestion[] = event.questions.map((q: unknown) => {
+          const raw = q as Record<string, unknown>;
+          const options = ((raw.options as Array<Record<string, unknown>>) || []).map((o) => ({
+            label: (o.label as string) || "",
+            description: o.description as string | undefined,
+          }));
+          return {
+            question: (raw.question as string) || "",
+            options,
+            multiSelect: (raw.multiSelect as boolean) || false,
+          };
+        });
+        sessionManager.setPendingQuestions(sessionId, parsed, targetChat);
+        scheduleNextQuestionPoll(sessionId);
+        return;
       }
-      if (targets.size === 0) return;
 
-      for (const cid of targets) {
-        if (isChatMutedForChat(cid)) {
-          if (!active) setTypingForChat(cid, false);
-          continue;
+      if (event.kind === "approvalNeeded") {
+        const targetChat = sessionManager.getBoundChat(sessionId);
+        if (!targetChat) {
+          logger.info("handleConversationEvent approvalNeeded: no bound chat", { sessionId, chatId: remote.chatId });
+          return;
         }
-        setTypingForChat(cid, active);
-      }
-    },
-    handleApprovalNeeded(sessionId: string, name: string, input: Record<string, unknown>, promptText?: string, pollOptions?: string[]): void {
-      const remote = sessionManager.getRemote(sessionId);
-      if (!remote) { logger.info("handleApprovalNeeded: no remote", { sessionId }); return; }
-      const targetChat = sessionManager.getBoundChat(sessionId);
-      if (!targetChat) { logger.info("handleApprovalNeeded: no bound chat", { sessionId, chatId: remote.chatId }); return; }
-      // Use the prompt text from Claude Code's terminal if available
-      let question: string;
-      if (promptText) {
-        question = promptText.slice(0, 300);
-      } else {
-        const detail = (input.command as string) || (input.file_path as string)
-          || (input.pattern as string) || (input.query as string)
-          || (input.url as string) || (input.description as string) || "";
-        const label = detail.length > 200 ? detail.slice(0, 200) + "..." : detail;
-        question = (label ? `${name}: ${label}` : name).slice(0, 300);
-      }
-      const options = pollOptions && pollOptions.length >= 2 ? pollOptions : ["Yes", "Yes, don't ask again", "No"];
-      sendPollToChat(targetChat, question, options, false).then(
-        (sent) => {
-          if (!sent) return;
+        enqueueOrderedConversationDelivery(targetChat, async (timeoutMs) => {
+          if (isChatMutedForChat(targetChat)) {
+            setTypingForChat(targetChat, false);
+            return;
+          }
+          let question: string;
+          if (event.promptText) {
+            question = event.promptText.slice(0, 300);
+          } else {
+            const detail = (event.input.command as string) || (event.input.file_path as string)
+              || (event.input.pattern as string) || (event.input.query as string)
+              || (event.input.url as string) || (event.input.description as string) || "";
+            const label = detail.length > 200 ? detail.slice(0, 200) + "..." : detail;
+            question = (label ? `${event.name}: ${label}` : event.name).slice(0, 300);
+          }
+          const options = event.pollOptions && event.pollOptions.length >= 2
+            ? event.pollOptions
+            : ["Yes", "Yes, don't ask again", "No"];
+          const sent = await sendPollToChat(targetChat, question, options, false, { timeoutMs });
+          if (!sent) throw new Error("Channel does not support approval polls");
           const { pollId, messageId } = sent;
           sessionManager.registerPoll(pollId, {
             sessionId,
@@ -2384,72 +2464,89 @@ export async function startDaemon(): Promise<void> {
             question,
             optionLabels: options,
           });
-        }
-      ).catch((e) => {
-        logger.error("Failed to send tool approval poll", { sessionId, error: (e as Error).message });
-      });
-    },
-    handleThinking(sessionId: string, text: string): void {
-      const remote = sessionManager.getRemote(sessionId);
-      if (!remote) return;
-      const targets = new Set<ChannelChatId>();
-      const targetChat = sessionManager.getBoundChat(sessionId);
-      if (targetChat) targets.add(targetChat);
-      for (const groupChatId of sessionManager.getSubscribedGroups(sessionId)) {
-        targets.add(groupChatId);
+        });
+        return;
       }
+
+      const targets = getConversationTargets(sessionId);
       if (targets.size === 0) return;
 
+      let resolvedArtifact: { filePath: string; defaultCaption: string } | null = null;
+      if (event.kind === "assistantFile") {
+        resolvedArtifact = await resolveSessionArtifactPath(sessionId, event.filePath);
+      }
+
       for (const cid of targets) {
-        if (isChatMutedForChat(cid)) continue;
-        const output = getOutputPreferencesForChat(cid);
-        const fmt = getFormatterForChat(cid);
-        const message = formatThinkingNotification(fmt, output.thinkingMode, text);
-        if (!message) continue;
-        sendToChat(cid, message);
+        enqueueOrderedConversationDelivery(cid, async (timeoutMs) => {
+          const channel = getChannelForChat(cid);
+          if (!channel) throw new Error(`No channel available for ${cid.split(":")[0]}`);
+          const output = getOutputPreferencesForChat(cid);
+          const fmt = getFormatterForChat(cid);
+
+          if (event.kind === "assistant") {
+            if (isChatMutedForChat(cid)) {
+              setTypingForChat(cid, false);
+              return;
+            }
+            setTypingForChat(cid, false);
+            await channel.send(cid, fmt.fromMarkdown(event.text), { timeoutMs });
+            return;
+          }
+
+          if (event.kind === "thinking") {
+            if (isChatMutedForChat(cid)) return;
+            const message = formatThinkingNotification(fmt, output.thinkingMode, event.text);
+            if (!message) return;
+            await channel.send(cid, message, { timeoutMs });
+            return;
+          }
+
+          if (event.kind === "toolCall") {
+            if (isChatMutedForChat(cid) || output.toolCallMode === "off") return;
+            const detailMode = output.toolCallMode === "detailed" ? "verbose" : "simple";
+            const html = formatToolCall(fmt, event.name, event.input, detailMode, remote.cwd);
+            if (!html) return;
+            await channel.send(cid, html, { timeoutMs });
+            setTypingForChat(cid, true);
+            return;
+          }
+
+          if (event.kind === "toolResult") {
+            if (isChatMutedForChat(cid)) return;
+            const message = formatToolResultNotification(fmt, output, event.toolName, event.content, event.isError === true);
+            if (!message) return;
+            await channel.send(cid, message, { timeoutMs });
+            if (event.isError !== true) setTypingForChat(cid, true);
+            return;
+          }
+
+          if (event.kind === "assistantFile") {
+            if (isChatMutedForChat(cid)) {
+              setTypingForChat(cid, false);
+              return;
+            }
+            if (!resolvedArtifact) throw new Error("Resolved artifact path missing");
+            if (!channel.sendDocument) throw new Error(`Channel ${cid.split(":")[0]} does not support file sending`);
+            setTypingForChat(cid, false);
+            const caption = (event.caption && event.caption.trim()) || resolvedArtifact.defaultCaption;
+            await channel.sendDocument(cid, resolvedArtifact.filePath, caption, { timeoutMs });
+          }
+        });
       }
     },
-    handleAssistantText(sessionId: string, text: string): void {
+    handleTyping(sessionId: string, active: boolean): void {
       const remote = sessionManager.getRemote(sessionId);
       if (!remote) return;
 
-      const targets = new Set<ChannelChatId>();
-      const targetChat = sessionManager.getBoundChat(sessionId);
-      if (targetChat) targets.add(targetChat);
-      for (const groupChatId of sessionManager.getSubscribedGroups(sessionId)) {
-        targets.add(groupChatId);
-      }
+      const targets = getConversationTargets(sessionId);
       if (targets.size === 0) return;
 
       for (const cid of targets) {
         if (isChatMutedForChat(cid)) {
-          setTypingForChat(cid, false);
+          if (!active) setTypingForChat(cid, false);
           continue;
         }
-        const fmt = getFormatterForChat(cid);
-        setTypingForChat(cid, false);
-        sendToChat(cid, fmt.fromMarkdown(text));
-      }
-    },
-    handleToolResult(sessionId: string, toolName: string, content: string, isError = false): void {
-      const remote = sessionManager.getRemote(sessionId);
-      if (!remote) return;
-      const targets = new Set<ChannelChatId>();
-      const targetChat = sessionManager.getBoundChat(sessionId);
-      if (targetChat) targets.add(targetChat);
-      for (const groupChatId of sessionManager.getSubscribedGroups(sessionId)) {
-        targets.add(groupChatId);
-      }
-      if (targets.size === 0) return;
-
-      for (const cid of targets) {
-        if (isChatMutedForChat(cid)) continue;
-        const output = getOutputPreferencesForChat(cid);
-        const fmt = getFormatterForChat(cid);
-        const message = formatToolResultNotification(fmt, output, toolName, content, isError);
-        if (!message) continue;
-        sendToChat(cid, message);
-        if (!isError) setTypingForChat(cid, true);
+        setTypingForChat(cid, active);
       }
     },
     handleBackgroundJob(
@@ -2507,26 +2604,7 @@ export async function startDaemon(): Promise<void> {
 
       void refreshBackgroundBoards(sessionId);
     },
-    handleQuestion(sessionId: string, questions: unknown[]): void {
-      const remote = sessionManager.getRemote(sessionId);
-      if (!remote) return;
-      // Parse raw questions into AskQuestion format
-      const parsed: AskQuestion[] = questions.map((q: unknown) => {
-        const raw = q as Record<string, unknown>;
-        const options = ((raw.options as Array<Record<string, unknown>>) || []).map((o) => ({
-          label: (o.label as string) || "",
-          description: o.description as string | undefined,
-        }));
-        return {
-          question: (raw.question as string) || "",
-          options,
-          multiSelect: (raw.multiSelect as boolean) || false,
-        };
-      });
-      const targetChat = sessionManager.getBoundChat(sessionId);
-      sessionManager.setPendingQuestions(sessionId, parsed, targetChat);
-      sendNextPoll(sessionId);
-    },
+
     // --- Config channel management ---
     async getConfigChannels(): Promise<ConfigChannelSummary[]> {
       await refreshConfig();

@@ -238,6 +238,7 @@ describe("chat output preferences", () => {
       ...DEFAULT_CHAT_OUTPUT_PREFERENCES,
       backgroundJobs: false,
       typingIndicator: false,
+      orderingNotices: true,
     });
 
     const changed = applyChatTranscriptPreset(config, "telegram:100", "thinking");
@@ -249,6 +250,7 @@ describe("chat output preferences", () => {
       toolErrors: true,
       backgroundJobs: false,
       typingIndicator: false,
+      orderingNotices: true,
     });
     expect(getChatTranscriptPresetLabel(config, "telegram:100")).toBe("thinking");
   });
@@ -264,6 +266,7 @@ describe("chat output preferences", () => {
       toolErrors: true,
       backgroundJobs: true,
       typingIndicator: true,
+      orderingNotices: false,
     });
     expect(getChatTranscriptPresetLabel(config, "telegram:100")).toBe("verbose");
   });
@@ -294,6 +297,7 @@ describe("chat output preferences", () => {
       toolErrors: true,
       backgroundJobs: false,
       typingIndicator: true,
+      orderingNotices: false,
     });
     expect(getChatTranscriptPresetLabel(config, "telegram:100")).toBe("thinking");
   });

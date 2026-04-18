@@ -99,14 +99,15 @@ export type PendingOutputModeOption =
   | { kind: "toolResultMode"; value: ToolResultMode }
   | { kind: "toolErrors"; value: boolean }
   | { kind: "backgroundJobs"; value: boolean }
-  | { kind: "typingIndicator"; value: boolean };
+  | { kind: "typingIndicator"; value: boolean }
+  | { kind: "orderingNotices"; value: boolean };
 
 export interface PendingOutputModePicker {
   pollId: string;
   messageId: string;
   chatId: ChannelChatId;
   ownerUserId: ChannelUserId;
-  step: "preset" | "thinkingMode" | "toolCallMode" | "toolResultMode" | "toolErrors" | "backgroundJobs" | "typingIndicator";
+  step: "preset" | "thinkingMode" | "toolCallMode" | "toolResultMode" | "toolErrors" | "backgroundJobs" | "typingIndicator" | "orderingNotices";
   options: PendingOutputModeOption[];
   pendingOutput?: ChatOutputPreferences;
 }

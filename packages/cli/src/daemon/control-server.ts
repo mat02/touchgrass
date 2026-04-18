@@ -32,6 +32,15 @@ export interface ConfigChannelDetails {
   linkedGroups: Array<{ chatId: string; title?: string; linkedAt: string }>;
 }
 
+export type ConversationEvent =
+  | { kind: "assistant"; text: string }
+  | { kind: "assistantFile"; filePath: string; caption?: string }
+  | { kind: "thinking"; text: string }
+  | { kind: "question"; questions: unknown[] }
+  | { kind: "toolCall"; name: string; input: Record<string, unknown> }
+  | { kind: "toolResult"; toolName: string; content: string; isError?: boolean }
+  | { kind: "approvalNeeded"; name: string; input: Record<string, unknown>; promptText?: string; pollOptions?: string[] };
+
 export interface DaemonContext {
   authToken: string;
   startedAt: number;
@@ -40,7 +49,7 @@ export interface DaemonContext {
   shutdown: () => Promise<void>;
   generatePairingCode: () => string;
   getChannels: () => Promise<ChannelInfo[]>;
-  registerRemote: (command: string, chatId: ChannelChatId, ownerUserId: ChannelUserId, cwd: string, sessionId?: string, subscribedGroups?: string[], name?: string) => Promise<{ sessionId: string; dmBusy: boolean; linkedGroups: Array<{ chatId: string; title?: string }>; allLinkedGroups: Array<{ chatId: string; title?: string }> }>;
+  registerRemote: (command: string, chatId: ChannelChatId, ownerUserId: ChannelUserId, cwd: string, sessionId?: string, subscribedGroups?: string[], name?: string) => Promise<{ sessionId: string; dmBusy: boolean; linkedGroups: Array<{ chatId: string; title?: string }>; allLinkedGroups: Array<{ chatId: string; title?: string }> }> ;
   bindChat: (sessionId: string, chatId: ChannelChatId) => Promise<{ ok: boolean; error?: string }>;
   canUserAccessSession: (userId: ChannelUserId, sessionId: string) => boolean;
   drainRemoteInput: (sessionId: string) => string[];
@@ -50,13 +59,8 @@ export interface DaemonContext {
   endRemote: (sessionId: string, exitCode: number | null) => void;
   getSubscribedGroups: (sessionId: string) => string[];
   getBoundChat: (sessionId: string) => string | null;
-  handleQuestion: (sessionId: string, questions: unknown[]) => void;
-  handleToolCall: (sessionId: string, name: string, input: Record<string, unknown>) => void;
+  handleConversationEvent: (sessionId: string, event: ConversationEvent) => Promise<void>;
   handleTyping: (sessionId: string, active: boolean) => void;
-  handleApprovalNeeded: (sessionId: string, name: string, input: Record<string, unknown>, promptText?: string, pollOptions?: string[]) => void;
-  handleThinking: (sessionId: string, text: string) => void;
-  handleAssistantText: (sessionId: string, text: string) => void;
-  handleToolResult: (sessionId: string, toolName: string, content: string, isError?: boolean) => void;
   handleBackgroundJob: (
     sessionId: string,
     event: {
@@ -335,7 +339,7 @@ export async function startControlServer(ctx: DaemonContext): Promise<void> {
               pollOptions[1] = `Yes, always allow ${toolName}`;
             }
           }
-          ctx.handleApprovalNeeded(sessionId, toolName, toolInput, promptText, pollOptions);
+          await ctx.handleConversationEvent(sessionId, { kind: "approvalNeeded", name: toolName, input: toolInput, promptText, pollOptions });
           return Response.json({ ok: true });
         }
 
@@ -367,27 +371,41 @@ export async function startControlServer(ctx: DaemonContext): Promise<void> {
       }
 
       // Match /remote/:id/* actions
-      const remoteMatch = path.match(/^\/remote\/(r-[a-f0-9]+)\/(input|exit|subscribed-groups|question|tool-call|thinking|assistant|tool-result|approval-needed|typing|background-job|send-input|send-file|send-message)$/);
+      const remoteMatch = path.match(/^\/remote\/(r-[a-f0-9]+)\/(input|exit|subscribed-groups|conversation-event|typing|background-job|send-input|send-message)$/);
       if (remoteMatch) {
         const [, sessionId, action] = remoteMatch;
-        if (action === "assistant" && req.method === "POST") {
+        if (action === "conversation-event" && req.method === "POST") {
           const body = await readJsonBody(req);
-          const text = body.text as string;
-          if (!text) {
-            return Response.json({ ok: false, error: "Missing text" }, { status: 400 });
+          const kind = body.kind as ConversationEvent["kind"] | undefined;
+          if (!kind) {
+            return Response.json({ ok: false, error: "Missing kind" }, { status: 400 });
           }
-          ctx.handleAssistantText(sessionId, text);
-          return Response.json({ ok: true });
-        }
-        if (action === "tool-result" && req.method === "POST") {
-          const body = await readJsonBody(req);
-          const toolName = body.toolName as string;
-          const content = body.content as string;
-          const isError = body.isError === true;
-          if (!toolName || !content) {
-            return Response.json({ ok: false, error: "Missing toolName or content" }, { status: 400 });
+
+          let event: ConversationEvent | null = null;
+          if ((kind === "assistant" || kind === "thinking") && typeof body.text === "string" && body.text) {
+            event = { kind, text: body.text };
+          } else if (kind === "assistantFile" && typeof body.filePath === "string" && body.filePath) {
+            event = { kind, filePath: body.filePath, caption: typeof body.caption === "string" ? body.caption : undefined };
+          } else if (kind === "question" && Array.isArray(body.questions)) {
+            event = { kind, questions: body.questions as unknown[] };
+          } else if (kind === "toolCall" && typeof body.name === "string" && body.name) {
+            event = { kind, name: body.name, input: (body.input as Record<string, unknown>) || {} };
+          } else if (kind === "toolResult" && typeof body.toolName === "string" && body.toolName && typeof body.content === "string" && body.content) {
+            event = { kind, toolName: body.toolName, content: body.content, isError: body.isError === true };
+          } else if (kind === "approvalNeeded" && typeof body.name === "string" && body.name) {
+            event = {
+              kind,
+              name: body.name,
+              input: (body.input as Record<string, unknown>) || {},
+              promptText: typeof body.promptText === "string" ? body.promptText : undefined,
+              pollOptions: Array.isArray(body.pollOptions) ? body.pollOptions.filter((value): value is string => typeof value === "string") : undefined,
+            };
           }
-          ctx.handleToolResult(sessionId, toolName, content, isError);
+
+          if (!event) {
+            return Response.json({ ok: false, error: "Invalid conversation event payload" }, { status: 400 });
+          }
+          await ctx.handleConversationEvent(sessionId, event);
           return Response.json({ ok: true });
         }
         if (action === "background-job" && req.method === "POST") {
@@ -406,50 +424,10 @@ export async function startControlServer(ctx: DaemonContext): Promise<void> {
           ctx.handleBackgroundJob(sessionId, { taskId, status, command, outputFile, summary, urls });
           return Response.json({ ok: true });
         }
-        if (action === "thinking" && req.method === "POST") {
-          const body = await readJsonBody(req);
-          const text = body.text as string;
-          if (!text) {
-            return Response.json({ ok: false, error: "Missing text" }, { status: 400 });
-          }
-          ctx.handleThinking(sessionId, text);
-          return Response.json({ ok: true });
-        }
-        if (action === "tool-call" && req.method === "POST") {
-          const body = await readJsonBody(req);
-          const name = body.name as string;
-          const input = (body.input as Record<string, unknown>) || {};
-          if (!name) {
-            return Response.json({ ok: false, error: "Missing name" }, { status: 400 });
-          }
-          ctx.handleToolCall(sessionId, name, input);
-          return Response.json({ ok: true });
-        }
         if (action === "typing" && req.method === "POST") {
           const body = await readJsonBody(req);
           const active = body.active === true;
           ctx.handleTyping(sessionId, active);
-          return Response.json({ ok: true });
-        }
-        if (action === "approval-needed" && req.method === "POST") {
-          const body = await readJsonBody(req);
-          const name = body.name as string;
-          const input = (body.input as Record<string, unknown>) || {};
-          if (!name) {
-            return Response.json({ ok: false, error: "Missing name" }, { status: 400 });
-          }
-          const promptText = (body.promptText as string) || undefined;
-          const pollOptions = Array.isArray(body.pollOptions) ? body.pollOptions as string[] : undefined;
-          ctx.handleApprovalNeeded(sessionId, name, input, promptText, pollOptions);
-          return Response.json({ ok: true });
-        }
-        if (action === "question" && req.method === "POST") {
-          const body = await readJsonBody(req);
-          const questions = body.questions as unknown[];
-          if (!questions || !Array.isArray(questions)) {
-            return Response.json({ ok: false, error: "Missing questions" }, { status: 400 });
-          }
-          ctx.handleQuestion(sessionId, questions);
           return Response.json({ ok: true });
         }
         if (action === "input" && req.method === "GET") {
@@ -483,19 +461,6 @@ export async function startControlServer(ctx: DaemonContext): Promise<void> {
           }
           const pushed = ctx.pushRemoteInput(sessionId, text);
           return Response.json({ ok: pushed });
-        }
-        if (action === "send-file" && req.method === "POST") {
-          const body = await readJsonBody(req);
-          const filePath = body.filePath as string;
-          const caption = body.caption as string | undefined;
-          if (!filePath) {
-            return Response.json({ ok: false, error: "Missing filePath" }, { status: 400 });
-          }
-          const result = await ctx.sendFileToSession(sessionId, filePath, caption);
-          if (!result.ok) {
-            return Response.json({ ok: false, error: result.error || "Failed to send file" }, { status: 400 });
-          }
-          return Response.json({ ok: true });
         }
         if (action === "send-message" && req.method === "POST") {
           const body = await readJsonBody(req);
