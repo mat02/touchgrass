@@ -130,6 +130,43 @@ function getFirstString(input: Record<string, unknown>, keys: string[]): string 
   return undefined;
 }
 
+function getTaskItemSummary(task: Record<string, unknown>): string | undefined {
+  return getFirstString(task, ["description", "title", "content", "name", "task", "id"]);
+}
+
+function formatLowercaseTaskToolCall(
+  fmt: Formatter,
+  input: Record<string, unknown>,
+  mode: ToolDisplayMode
+): string {
+  const agent = getFirstString(input, ["agent", "agent_type", "type"]);
+  const context = getFirstString(input, ["context", "description", "message", "prompt"]);
+  const tasks = Array.isArray(input.tasks)
+    ? input.tasks.filter((task): task is Record<string, unknown> => !!task && typeof task === "object")
+    : [];
+
+  const titleLimit = mode === "simple" ? 2 : 3;
+  const taskTitles = tasks
+    .map((task) => getTaskItemSummary(task))
+    .filter((title): title is string => typeof title === "string" && title.length > 0);
+  const shownTitles = taskTitles.slice(0, titleLimit).map((title) => truncateText(title, mode === "simple" ? 70 : 110));
+  const hiddenCount = tasks.length - shownTitles.length;
+
+  const parts: string[] = [`${fmt.escape("🧩")} ${fmt.code(fmt.escape("task"))}`];
+  if (agent) parts.push(`${fmt.escape("•")} ${fmt.escape(agent)}`);
+  if (tasks.length > 0) parts.push(`${fmt.escape("•")} ${fmt.escape(`${tasks.length} requested`)}`);
+
+  let line = parts.join(" ");
+  if (shownTitles.length > 0) {
+    const more = hiddenCount > 0 ? ` +${hiddenCount} more` : "";
+    line += `\n${fmt.escape("↳")} ${fmt.escape(`${shownTitles.join("; ")}${more}`)}`;
+  } else if (context) {
+    line += `\n${fmt.escape("↳")} ${fmt.italic(fmt.escape(truncateText(context, mode === "simple" ? 120 : 200)))}`;
+  }
+
+  return line;
+}
+
 function describeTaskChanges(input: Record<string, unknown>): string | undefined {
   const merged: Record<string, unknown> = {};
 
@@ -388,6 +425,8 @@ export function formatToolCall(
       if (mode === "simple") return `${fmt.escape("🤖")} ${fmt.italic(fmt.escape(truncateText(desc, 140)))}${promptLine}`;
       return `${fmt.escape("🤖")} ${fmt.italic(fmt.escape(desc))}${promptLine}`;
     }
+    case "task":
+      return formatLowercaseTaskToolCall(fmt, input, mode);
     case "todo_write":
       return formatTodoWriteToolCall(fmt, input);
     case "spawn_agent": {

@@ -196,6 +196,36 @@ function extractEntries(msg: Record<string, unknown>): DisplayEntry[] {
   return entries;
 }
 
+function getFirstString(input: Record<string, unknown>, keys: string[]): string | undefined {
+  for (const key of keys) {
+    const value = input[key];
+    if (typeof value === "string" && value.trim()) return value.trim();
+    if (typeof value === "number" && Number.isFinite(value)) return String(value);
+  }
+  return undefined;
+}
+
+function summarizeLowercaseTaskInput(input: Record<string, unknown>): string {
+  const agent = getFirstString(input, ["agent", "agent_type", "type"]);
+  const context = getFirstString(input, ["context", "description", "message", "prompt"]);
+  const tasks = Array.isArray(input.tasks)
+    ? input.tasks.filter((task): task is Record<string, unknown> => !!task && typeof task === "object")
+    : [];
+
+  const labels = tasks
+    .map((task) => getFirstString(task, ["description", "title", "content", "name", "task", "id"]))
+    .filter((label): label is string => typeof label === "string" && label.length > 0);
+
+  const shown = labels.slice(0, 3).map((label) => truncate(label, 45));
+  const more = tasks.length - shown.length;
+  const parts: string[] = [];
+  if (agent) parts.push(agent);
+  if (tasks.length > 0) parts.push(`${tasks.length} requested`);
+  if (shown.length > 0) parts.push(`${shown.join("; ")}${more > 0 ? ` +${more} more` : ""}`);
+  else if (context) parts.push(truncate(context, 60));
+  return parts.join(" • ") || "subagent";
+}
+
 function summarizeToolInput(name: string, input: Record<string, unknown>): string {
   switch (name) {
     case "Bash":
@@ -225,6 +255,8 @@ function summarizeToolInput(name: string, input: Record<string, unknown>): strin
       const desc = input.description as string;
       return desc ? truncate(desc, 60) : "subagent";
     }
+    case "task":
+      return summarizeLowercaseTaskInput(input);
     case "WebSearch": {
       const query = input.query as string;
       return query ? truncate(query, 60) : "search";

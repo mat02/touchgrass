@@ -43,6 +43,46 @@ describe("tool display formatting", () => {
     expect(formatToolCall(fmt, "find", { pattern: "src/**/*.ts" }, "simple", "/repo")).toContain("src/**/*.ts");
   });
 
+  it("shows lowercase task call count and task titles in simple mode", () => {
+    const rendered = formatToolCall(
+      fmt,
+      "task",
+      {
+        agent: "quick_task",
+        tasks: [
+          { description: "Audit auth layer" },
+          { title: "Add integration coverage" },
+          { content: "Verify migration rollback" },
+          { description: "Report findings" },
+        ],
+      },
+      "simple"
+    );
+
+    expect(rendered).toContain("task");
+    expect(rendered).toContain("quick_task");
+    expect(rendered).toContain("4 requested");
+    expect(rendered).toContain("Audit auth layer");
+    expect(rendered).toContain("Add integration coverage");
+    expect(rendered).toContain("+2 more");
+  });
+
+  it("falls back to agent/context for lowercase task calls without task list", () => {
+    const rendered = formatToolCall(
+      fmt,
+      "task",
+      {
+        agent: "explore",
+        context: "Inspect payment retry behavior and summarize notable paths",
+      },
+      "simple"
+    );
+
+    expect(rendered).toContain("task");
+    expect(rendered).toContain("explore");
+    expect(rendered).toContain("Inspect payment retry behavior");
+  });
+
   it("summarizes todo_write replace ops in simple mode", () => {
     const rendered = formatToolCall(
       fmt,
