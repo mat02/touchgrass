@@ -374,48 +374,94 @@ describe("daemon output controls", () => {
     expect(notices).toEqual([{ chatId: "telegram:1", timeoutMs: 1500 }]);
     expect(calls).toEqual(["after-skip"]);
   });
-  it("keeps the latest assistant message in buffered replay output", () => {
-    const flush = __daemonTestUtils.buildBufferedDeliveryFlush(fmt, [
-      {
-        at: 1,
-        role: "tool",
-        summaryText: "Read README.md",
-        fullMessage: "🛠️ <b>[Tool]</b> Read README.md",
-        countsForSummary: true,
-        countsForReplay: true,
-      },
-      {
-        at: 2,
-        role: "user",
-        summaryText: "Please update the docs",
-        fullMessage: "🙋 <b>[User]</b> Please update the docs",
-        countsForSummary: true,
-        countsForReplay: true,
-      },
-      {
-        at: 3,
-        role: "tool",
-        summaryText: "Search results ready",
-        fullMessage: "🛠️ <b>[Tool]</b> Search results ready",
-        countsForSummary: true,
-        countsForReplay: true,
-      },
-      {
-        at: 4,
-        role: "assistant",
-        summaryText: "I need your approval before editing production config",
-        fullMessage: "🤖 <b>[Assistant]</b> I need your approval before editing production config",
-        countsForSummary: true,
-        countsForReplay: true,
-      },
-    ]);
+  const bufferedEntriesForAutomaticFlush = [
+    {
+      at: 1,
+      role: "tool" as const,
+      summaryText: "Read README.md",
+      fullMessage: "🛠️ <b>[Tool]</b> Read README.md",
+      countsForSummary: true,
+      countsForReplay: true,
+    },
+    {
+      at: 2,
+      role: "user" as const,
+      summaryText: "Please update the docs",
+      fullMessage: "🙋 <b>[User]</b> Please update the docs",
+      countsForSummary: true,
+      countsForReplay: true,
+    },
+    {
+      at: 3,
+      role: "tool" as const,
+      summaryText: "Search results ready",
+      fullMessage: "🛠️ <b>[Tool]</b> Search results ready",
+      countsForSummary: true,
+      countsForReplay: true,
+    },
+    {
+      at: 4,
+      role: "assistant" as const,
+      summaryText: "I need your approval before editing production config",
+      fullMessage: "🤖 <b>[Assistant]</b> I need your approval before editing production config",
+      countsForSummary: true,
+      countsForReplay: true,
+    },
+  ];
 
-    expect(flush.summaryMessage).toContain("Recent activity");
-    expect(flush.replayMessages).toEqual([
+  it("selects summary and replay messages for non-empty automatic flush", () => {
+    const messages = __daemonTestUtils.selectAutomaticBufferedDeliveryMessages(fmt, bufferedEntriesForAutomaticFlush);
+
+    expect(messages).toHaveLength(4);
+    expect(messages[0]).toContain("Recent activity");
+    expect(messages.slice(1)).toEqual([
       "🙋 <b>[User]</b> Please update the docs",
       "🛠️ <b>[Tool]</b> Search results ready",
       "🤖 <b>[Assistant]</b> I need your approval before editing production config",
     ]);
+  });
+
+  it("returns no messages for empty automatic flush without notice", () => {
+    const messages = __daemonTestUtils.selectAutomaticBufferedDeliveryMessages(fmt, []);
+
+    expect(messages).toEqual([]);
+  });
+
+  it("keeps explicit notice distinct from replay when automatic buffer is empty", () => {
+    const noticeMessage = "⏳ Throttle is still active.";
+    const messages = __daemonTestUtils.selectAutomaticBufferedDeliveryMessages(
+      fmt,
+      [],
+      { noticeMessage }
+    );
+
+    expect(messages).toEqual([noticeMessage]);
+  });
+
+  it("suppresses replay when includeReplay is false while keeping notice and summary", () => {
+    const noticeMessage = "⏳ Throttle is still active.";
+    const messages = __daemonTestUtils.selectAutomaticBufferedDeliveryMessages(
+      fmt,
+      bufferedEntriesForAutomaticFlush,
+      { noticeMessage, includeReplay: false }
+    );
+
+    expect(messages).toHaveLength(2);
+    expect(messages[0]).toBe(noticeMessage);
+    expect(messages[1]).toContain("Recent activity");
+  });
+
+  it("keeps manual recent-history replay helper behavior for explicit replay", () => {
+    const raw = [
+      JSON.stringify({ type: "user", message: { content: [{ type: "text", text: "first user" }] } }),
+      JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "latest assistant" }] } }),
+    ].join("\n");
+
+    const replay = __daemonTestUtils.buildRecentActivityReplayMessages(fmt, raw, 10);
+
+    expect(replay.summaryMessage).toContain("📋 Recent activity:");
+    expect(replay.summaryMessage).toContain("<b>[User]</b> first user");
+    expect(replay.assistantMessage).toBe("🤖 <b>[Assistant]</b> latest assistant");
   });
 
   it("suppresses question polls while mute is active", async () => {

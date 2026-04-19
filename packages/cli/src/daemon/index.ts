@@ -198,35 +198,6 @@ function formatDeliveryMinutes(minutes: number): string {
   return `${minutes} minute${minutes === 1 ? "" : "s"}`;
 }
 
-function formatReplayMessage(fmt: Formatter, entry: DisplayEntry): string {
-  const roleLabel = entry.role === "assistant" ? "Assistant" : entry.role === "user" ? "User" : "Tool";
-  const emoji = entry.role === "assistant" ? "🤖" : entry.role === "user" ? "🙋" : "🛠️";
-  return `${fmt.escape(emoji)} ${fmt.bold(`[${roleLabel}]`)} ${fmt.escape(entry.text)}`;
-}
-
-function buildSummaryMessageFromDisplayEntries(fmt: Formatter, entries: DisplayEntry[]): string | null {
-  if (entries.length === 0) return null;
-  return `${fmt.escape("📋")} Recent activity:\n\n${entries.map((entry) => {
-    const roleLabel = entry.role === "assistant" ? "Assistant" : entry.role === "user" ? "User" : "Tool";
-    return `${fmt.bold(`[${roleLabel}]`)} ${fmt.escape(truncateDeliverySummary(entry.text))}`;
-  }).join("\n")}`;
-}
-
-function selectReplayDisplayEntries(
-  entries: DisplayEntry[],
-  lastAssistantEntry: DisplayEntry | null,
-  count: number
-): DisplayEntry[] {
-  const selected: DisplayEntry[] = [];
-  if (lastAssistantEntry) selected.push(lastAssistantEntry);
-  for (let i = entries.length - 1; i >= 0 && selected.length < count; i--) {
-    const candidate = entries[i];
-    if (!candidate) continue;
-    if (selected.some((entry) => entry.role === candidate.role && entry.text === candidate.text)) continue;
-    selected.push(candidate);
-  }
-  return selected.reverse();
-}
 
 function buildBufferedSummaryMessage(fmt: Formatter, entries: BufferedDeliveryEntry[]): string | null {
   const summaryEntries = entries
@@ -265,32 +236,24 @@ function buildBufferedDeliveryFlush(fmt: Formatter, entries: BufferedDeliveryEnt
   };
 }
 
-async function readSessionHistoryRaw(sessionId: string): Promise<string | null> {
-  const manifest = readManifests().get(sessionId);
-  if (!manifest?.jsonlFile) return null;
-  try {
-    return await readFile(manifest.jsonlFile, "utf-8");
-  } catch {
-    return null;
-  }
+function selectAutomaticBufferedDeliveryMessages(
+  fmt: Formatter,
+  entries: BufferedDeliveryEntry[],
+  options?: { noticeMessage?: string; includeReplay?: boolean }
+): string[] {
+  const flush = entries.length > 0
+    ? buildBufferedDeliveryFlush(fmt, entries)
+    : { summaryMessage: null, replayMessages: [] };
+  const replayMessages = options?.includeReplay === false
+    ? []
+    : flush.replayMessages.slice(0, DELIVERY_REPLAY_COUNT);
+  return [
+    options?.noticeMessage || null,
+    flush.summaryMessage,
+    ...replayMessages,
+  ].filter((message): message is string => typeof message === "string" && message.length > 0);
 }
 
-async function buildHistoryDeliveryFlush(
-  fmt: Formatter,
-  sessionId: string
-): Promise<{ summaryMessage: string | null; replayMessages: string[] }> {
-  const raw = await readSessionHistoryRaw(sessionId);
-  if (!raw) return { summaryMessage: null, replayMessages: [] };
-  const { recentEntries, lastAssistantEntry } = collectRecentActivityPreviewFromRaw(
-    raw,
-    Math.max(DELIVERY_SUMMARY_LIMIT, DELIVERY_REPLAY_COUNT + 3)
-  );
-  return {
-    summaryMessage: buildSummaryMessageFromDisplayEntries(fmt, recentEntries.slice(-DELIVERY_SUMMARY_LIMIT)),
-    replayMessages: selectReplayDisplayEntries(recentEntries, lastAssistantEntry, DELIVERY_REPLAY_COUNT)
-      .map((entry) => formatReplayMessage(fmt, entry)),
-  };
-}
 
 
 function createOrderedConversationQueue(deps: {
@@ -347,6 +310,8 @@ export const __daemonTestUtils = {
   formatToolResultNotification,
   buildRecentActivityReplayMessages,
   buildBufferedDeliveryFlush,
+  selectAutomaticBufferedDeliveryMessages,
+
 };
 
 type BackgroundJobStatus = "running" | "completed" | "failed" | "killed";
@@ -727,20 +692,9 @@ export async function startDaemon(): Promise<void> {
     const fmt = getFormatterForChat(chatId);
     const state = getDeliveryRuntimeState(sessionId, chatId);
     pruneDeliveryRuntimeState(state);
-    let flush = state.entries.length > 0
-      ? buildBufferedDeliveryFlush(fmt, state.entries)
-      : { summaryMessage: null, replayMessages: [] };
-    if (!flush.summaryMessage && flush.replayMessages.length === 0) {
-      flush = await buildHistoryDeliveryFlush(fmt, sessionId);
-    }
-    const replayMessages = options?.includeReplay === false
-      ? []
-      : flush.replayMessages.slice(0, DELIVERY_REPLAY_COUNT);
-    const messages = [
-      options?.noticeMessage || null,
-      flush.summaryMessage,
-      ...replayMessages,
-    ].filter((message): message is string => typeof message === "string" && message.length > 0);
+    // Automatic flushes may only send buffered runtime entries. History replay stays
+    // behind the explicit "Load recent messages?" user action to avoid duplicates.
+    const messages = selectAutomaticBufferedDeliveryMessages(fmt, state.entries, options);
     if (messages.length === 0) return true;
     try {
       for (const message of messages) {
