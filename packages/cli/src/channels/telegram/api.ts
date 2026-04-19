@@ -41,6 +41,7 @@ export interface TelegramMessage {
   date: number;
   text?: string;
   caption?: string;
+  media_group_id?: string;
   photo?: TelegramPhotoSize[];
   document?: TelegramDocument;
   reply_to_message?: TelegramMessage;

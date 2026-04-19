@@ -100,4 +100,46 @@ describe("stdin input pending file mentions", () => {
       '[sent from channel_id="telegram:-100:4" session_id="r-test02"]'
     );
   });
+
+  it("queues grouped album text as one stdin entry", async () => {
+    const config = createDefaultConfig();
+    const sessionManager = new SessionManager(defaultSettings);
+    const remote = sessionManager.registerRemote(
+      "codex",
+      "telegram:-100:4",
+      "telegram:1",
+      "/tmp/repo",
+      "r-test03"
+    );
+    sessionManager.attach("telegram:-100:4", remote.id);
+
+    const ctx = {
+      config,
+      sessionManager,
+      channel: {
+        fmt: {
+          code: (v: string) => v,
+          escape: (v: string) => v,
+        },
+        send: async () => {},
+      },
+    } as any;
+
+    const groupedText = "album caption /tmp/one.jpg /tmp/two.jpg";
+    await handleStdinInput(
+      {
+        userId: "telegram:1",
+        chatId: "telegram:-100:4",
+        text: groupedText,
+        fileUrls: ["/tmp/one.jpg", "/tmp/two.jpg"],
+        isGroup: true,
+      },
+      ctx
+    );
+
+    expect(remote.inputQueue).toHaveLength(1);
+    expect(remote.inputQueue[0]).toBe(
+      `${groupedText}\n[sent from channel_id="telegram:-100:4" session_id="r-test03"]`
+    );
+  });
 });

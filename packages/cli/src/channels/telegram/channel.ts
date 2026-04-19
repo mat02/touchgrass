@@ -1,6 +1,7 @@
 import {
   TelegramApi,
   type TelegramUpdate,
+  type TelegramMessage,
   type TelegramInlineKeyboardButton,
   type TelegramBotCommandScope,
 } from "./api";
@@ -77,6 +78,9 @@ function parseActionCallbackData(data: string | undefined): { pollId: string; op
   return { pollId: match[1], optionId };
 }
 
+const TELEGRAM_MEDIA_GROUP_BUFFER_MS = 1200;
+
+
 interface TelegramBotCommand {
   command: string;
   description: string;
@@ -150,6 +154,7 @@ export class TelegramChannel implements Channel {
   private actionPollByMessage: Map<string, string> = new Map();
   private statusBoards: Map<string, { messageId: number; pinned: boolean; html?: string }> = new Map();
   private commandMenuCache: Map<string, string> = new Map();
+  private mediaGroupBuffers: Map<string, { messages: TelegramMessage[]; lastSeenAt: number }> = new Map();
   private readonly tokenFingerprint: string;
   private pollerLock: { handle: FileHandle; path: string } | null = null;
   onPollAnswer: PollAnswerHandler | null = null;
@@ -173,6 +178,171 @@ export class TelegramChannel implements Channel {
       lower.includes("not enough rights")
     );
   }
+
+  private updateTopicCache(msg: TelegramMessage): void {
+    if (!msg.message_thread_id) return;
+    const key = `${msg.chat.id}:${msg.message_thread_id}`;
+    if (msg.forum_topic_edited?.name) {
+      this.topicNames.set(key, msg.forum_topic_edited.name);
+      return;
+    }
+    if (msg.forum_topic_created) {
+      this.topicNames.set(key, msg.forum_topic_created.name);
+      return;
+    }
+    if (msg.reply_to_message?.forum_topic_created && !this.topicNames.has(key)) {
+      this.topicNames.set(key, msg.reply_to_message.forum_topic_created.name);
+    }
+  }
+
+  private mediaGroupKey(msg: TelegramMessage): string | null {
+    if (!msg.media_group_id) return null;
+    const threadId = msg.message_thread_id ?? 0;
+    return `${msg.chat.id}:${threadId}:${msg.media_group_id}`;
+  }
+
+  private bufferMediaGroupMessage(msg: TelegramMessage): void {
+    const key = this.mediaGroupKey(msg);
+    if (!key) return;
+    const now = Date.now();
+    const existing = this.mediaGroupBuffers.get(key);
+    if (existing) {
+      existing.messages.push(msg);
+      existing.lastSeenAt = now;
+      return;
+    }
+    this.mediaGroupBuffers.set(key, {
+      messages: [msg],
+      lastSeenAt: now,
+    });
+  }
+
+  private async flushBufferedMediaGroups(
+    onMessage: (msg: InboundMessage) => Promise<void>,
+    now: number,
+    force = false
+  ): Promise<void> {
+    const ready: TelegramMessage[][] = [];
+    for (const [key, group] of this.mediaGroupBuffers) {
+      if (!force && now - group.lastSeenAt < TELEGRAM_MEDIA_GROUP_BUFFER_MS) continue;
+      this.mediaGroupBuffers.delete(key);
+      ready.push(group.messages.sort((a, b) => a.message_id - b.message_id));
+    }
+    for (const messages of ready) {
+      const inbound = await this.composeInboundMessage(messages);
+      if (inbound) await onMessage(inbound);
+    }
+  }
+
+  private async downloadMessageAttachment(msg: TelegramMessage): Promise<string | null> {
+    let downloadFileId: string | null = null;
+    let downloadFileExt = "jpg";
+    if (msg.photo && msg.photo.length > 0) {
+      const largest = msg.photo[msg.photo.length - 1];
+      downloadFileId = largest.file_id;
+    } else if (msg.document) {
+      downloadFileId = msg.document.file_id;
+      const name = msg.document.file_name || "";
+      const dotIdx = name.lastIndexOf(".");
+      if (dotIdx > 0) downloadFileExt = name.slice(dotIdx + 1);
+    }
+    if (!downloadFileId) return null;
+
+    try {
+      const file = await this.api.getFile(downloadFileId);
+      if (!file.file_path) return null;
+      const url = this.api.getFileUrl(file.file_path);
+      const ext = file.file_path.split(".").pop() || downloadFileExt;
+      const fileName = `${Date.now()}-${file.file_unique_id}.${ext}`;
+      await ensureDirs();
+      const localPath = join(paths.uploadsDir, fileName);
+      const res = await fetch(url);
+      if (!res.ok) {
+        await logger.error("Failed to download file", { status: res.status });
+        return null;
+      }
+      const buffer = await res.arrayBuffer();
+      await Bun.write(localPath, buffer);
+      await chmod(localPath, 0o600).catch(() => {});
+      return localPath;
+    } catch (e) {
+      await logger.error("Failed to resolve file", { error: (e as Error).message });
+      return null;
+    }
+  }
+
+  private async buildReplyQuote(reply: TelegramMessage, fileUrls: string[]): Promise<string | null> {
+    const quoteLines: string[] = [];
+    const replyFilePath = await this.downloadMessageAttachment(reply);
+    if (replyFilePath) {
+      fileUrls.push(replyFilePath);
+      quoteLines.push(`> [image: ${replyFilePath}]`);
+    }
+    const replyText = (reply.text || reply.caption || "").trim();
+    if (replyText) {
+      for (const line of replyText.split("\n")) {
+        quoteLines.push(`> ${line}`);
+      }
+    }
+    return quoteLines.length > 0 ? quoteLines.join("\n") : null;
+  }
+
+  private async composeInboundMessage(messages: TelegramMessage[]): Promise<InboundMessage | null> {
+    if (messages.length === 0) return null;
+    const primary = messages[0];
+    if (!primary) return null;
+    for (const msg of messages) this.updateTopicCache(msg);
+
+    const fileUrls: string[] = [];
+    let text = "";
+    let caption = "";
+    for (const msg of messages) {
+      if (!text && msg.text?.trim()) text = msg.text.trim();
+      if (!caption && msg.caption?.trim()) caption = msg.caption.trim();
+      const localPath = await this.downloadMessageAttachment(msg);
+      if (localPath) fileUrls.push(localPath);
+    }
+
+    if (caption) text = caption;
+    if (fileUrls.length > 0) {
+      const pathsText = messages.length === 1
+        ? fileUrls[0]
+        : fileUrls.join("\n");
+      text = text ? `${text} ${pathsText}` : pathsText;
+    }
+
+    const replySource = messages.find((msg) => msg.reply_to_message && !msg.reply_to_message.forum_topic_created);
+    if (replySource?.reply_to_message) {
+      const quoteBlock = await this.buildReplyQuote(replySource.reply_to_message, fileUrls);
+      if (quoteBlock) {
+        text = text ? `${quoteBlock}\n\n${text}` : quoteBlock;
+      }
+    }
+
+    if (!text) return null;
+    const sender = messages.find((msg) => msg.from)?.from;
+    if (!sender) return null;
+
+    text = this.stripBotMention(text);
+    if (!text) return null;
+
+    const isGroup = primary.chat.type !== "private";
+    const topicTitle = primary.message_thread_id && primary.message_thread_id !== 1
+      ? this.topicNames.get(`${primary.chat.id}:${primary.message_thread_id}`)
+      : undefined;
+
+    return {
+      userId: toUserId(this.channelName, sender.id),
+      chatId: toChatId(this.channelName, primary.chat.id, primary.message_thread_id),
+      username: sender.username,
+      text,
+      fileUrls: fileUrls.length > 0 ? fileUrls : undefined,
+      isGroup,
+      chatTitle: isGroup ? primary.chat.title : undefined,
+      topicTitle,
+    };
+  }
+
 
   setTyping(chatId: ChannelChatId, active: boolean): void {
     if (active) {
@@ -692,149 +862,20 @@ export class TelegramChannel implements Channel {
             if (update.message) {
               try {
                 const msg = update.message;
-                const isGroup = msg.chat.type !== "private";
-
-                // Cache forum topic names from service messages
-                if (msg.message_thread_id) {
-                  const key = `${msg.chat.id}:${msg.message_thread_id}`;
-                  // Edited name always wins (most recent)
-                  if (msg.forum_topic_edited?.name) {
-                    this.topicNames.set(key, msg.forum_topic_edited.name);
-                  } else if (msg.forum_topic_created) {
-                    this.topicNames.set(key, msg.forum_topic_created.name);
-                  } else if (msg.reply_to_message?.forum_topic_created && !this.topicNames.has(key)) {
-                    // Only use creation message from reply chain as fallback (it has the original name, not renamed)
-                    this.topicNames.set(key, msg.reply_to_message.forum_topic_created.name);
-                  }
+                if (msg.media_group_id) {
+                  this.bufferMediaGroupMessage(msg);
+                  continue;
                 }
 
-                // Download photos/documents to local disk and use file paths
-                let text = msg.text?.trim() || "";
-                const fileUrls: string[] = [];
-
-                // Determine file_id to download: photos or documents (files sent uncompressed)
-                let downloadFileId: string | null = null;
-                let downloadFileExt = "jpg";
-                if (msg.photo && msg.photo.length > 0) {
-                  const largest = msg.photo[msg.photo.length - 1];
-                  downloadFileId = largest.file_id;
-                } else if (msg.document) {
-                  downloadFileId = msg.document.file_id;
-                  const name = msg.document.file_name || "";
-                  const dotIdx = name.lastIndexOf(".");
-                  if (dotIdx > 0) downloadFileExt = name.slice(dotIdx + 1);
-                }
-
-                if (downloadFileId) {
-                  try {
-                    const file = await this.api.getFile(downloadFileId);
-                    if (file.file_path) {
-                      const url = this.api.getFileUrl(file.file_path);
-                      const ext = file.file_path.split(".").pop() || downloadFileExt;
-                      const fileName = `${Date.now()}-${file.file_unique_id}.${ext}`;
-                      await ensureDirs();
-                      const localPath = join(paths.uploadsDir, fileName);
-                      const res = await fetch(url);
-                      if (res.ok) {
-                        const buffer = await res.arrayBuffer();
-                        await Bun.write(localPath, buffer);
-                        await chmod(localPath, 0o600).catch(() => {});
-                        fileUrls.push(localPath);
-                        const caption = msg.caption?.trim() || "";
-                        text = caption
-                          ? `${caption} ${localPath}`
-                          : localPath;
-                      } else {
-                        await logger.error("Failed to download file", { status: res.status });
-                      }
-                    }
-                  } catch (e) {
-                    await logger.error("Failed to resolve file", { error: (e as Error).message });
-                  }
-                }
-
-                // Extract reply/quote context from replied-to message
-                const reply = msg.reply_to_message;
-                if (reply && !reply.forum_topic_created) {
-                  const quoteLines: string[] = [];
-
-                  // Download photo/document from the quoted message
-                  let replyFileId: string | null = null;
-                  let replyFileExt = "jpg";
-                  if (reply.photo && reply.photo.length > 0) {
-                    replyFileId = reply.photo[reply.photo.length - 1].file_id;
-                  } else if (reply.document) {
-                    replyFileId = reply.document.file_id;
-                    const name = reply.document.file_name || "";
-                    const dotIdx = name.lastIndexOf(".");
-                    if (dotIdx > 0) replyFileExt = name.slice(dotIdx + 1);
-                  }
-
-                  if (replyFileId) {
-                    try {
-                      const file = await this.api.getFile(replyFileId);
-                      if (file.file_path) {
-                        const url = this.api.getFileUrl(file.file_path);
-                        const ext = file.file_path.split(".").pop() || replyFileExt;
-                        const fileName = `${Date.now()}-${file.file_unique_id}.${ext}`;
-                        await ensureDirs();
-                        const localPath = join(paths.uploadsDir, fileName);
-                        const res = await fetch(url);
-                        if (res.ok) {
-                          const buffer = await res.arrayBuffer();
-                          await Bun.write(localPath, buffer);
-                          await chmod(localPath, 0o600).catch(() => {});
-                          fileUrls.push(localPath);
-                          quoteLines.push(`> [image: ${localPath}]`);
-                        }
-                      }
-                    } catch (e) {
-                      await logger.error("Failed to download reply file", { error: (e as Error).message });
-                    }
-                  }
-
-                  // Extract text/caption from the quoted message
-                  const replyText = (reply.text || reply.caption || "").trim();
-                  if (replyText) {
-                    for (const line of replyText.split("\n")) {
-                      quoteLines.push(`> ${line}`);
-                    }
-                  }
-
-                  if (quoteLines.length > 0) {
-                    const quoteBlock = quoteLines.join("\n");
-                    text = text ? `${quoteBlock}\n\n${text}` : quoteBlock;
-                  }
-                }
-
-                if (!text || !msg.from) continue;
-
-                // Strip @BotUsername mentions (common in groups)
-                text = this.stripBotMention(text);
-                if (!text) continue;
-
-                // Resolve topic title from cache
-                const topicTitle = msg.message_thread_id && msg.message_thread_id !== 1
-                  ? this.topicNames.get(`${msg.chat.id}:${msg.message_thread_id}`)
-                  : undefined;
-
-                const inbound: InboundMessage = {
-                  userId: toUserId(this.channelName, msg.from.id),
-                  chatId: toChatId(this.channelName, msg.chat.id, msg.message_thread_id),
-                  username: msg.from.username,
-                  text,
-                  fileUrls: fileUrls.length > 0 ? fileUrls : undefined,
-                  isGroup,
-                  chatTitle: isGroup ? msg.chat.title : undefined,
-                  topicTitle,
-                };
-
-                await onMessage(inbound);
+                await this.flushBufferedMediaGroups(onMessage, Date.now());
+                const inbound = await this.composeInboundMessage([msg]);
+                if (inbound) await onMessage(inbound);
               } catch (e) {
                 await logger.error("Error handling message", { error: (e as Error).message });
               }
             }
           }
+          await this.flushBufferedMediaGroups(onMessage, Date.now());
         } catch (e) {
           if (this.isPollingConflictError(e)) {
             await logger.error("Telegram polling conflict; stopping receiver", { error: (e as Error).message });
@@ -846,6 +887,11 @@ export class TelegramChannel implements Channel {
         }
       }
     } finally {
+      try {
+        await this.flushBufferedMediaGroups(onMessage, Date.now(), true);
+      } catch (e) {
+        await logger.error("Error flushing media groups", { error: (e as Error).message });
+      }
       this.running = false;
       await this.releasePollerLock();
     }

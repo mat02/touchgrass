@@ -1,5 +1,6 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, mock } from "bun:test";
 import { TelegramChannel, __telegramChannelTestUtils } from "../channels/telegram/channel";
+import { stat, unlink } from "fs/promises";
 
 describe("TelegramChannel actions", () => {
   it("uses inline keyboard for single-select actions and clears keyboard on close", async () => {
@@ -270,5 +271,103 @@ describe("Telegram command menus", () => {
       type: "chat",
       chat_id: 7,
     });
+  });
+});
+
+describe("TelegramChannel media groups", () => {
+  it("coalesces album items into one inbound message with both file paths", async () => {
+    const channel = new TelegramChannel("bot-token");
+    const anyChannel = channel as unknown as {
+      api: {
+        getMe: () => Promise<{ id: number; username: string }>;
+        setMyCommands: () => Promise<true>;
+        getUpdates: () => Promise<Array<{ update_id: number; message?: any }>>;
+        getFile: (fileId: string) => Promise<{ file_id: string; file_unique_id: string; file_path: string }>;
+        getFileUrl: (filePath: string) => string;
+      };
+      acquirePollerLock: () => Promise<void>;
+      releasePollerLock: () => Promise<void>;
+      cleanupOldUploads: () => Promise<void>;
+    };
+
+    anyChannel.acquirePollerLock = async () => {};
+    anyChannel.releasePollerLock = async () => {};
+    anyChannel.cleanupOldUploads = async () => {};
+
+    let pollCount = 0;
+    anyChannel.api = {
+      getMe: async () => ({ id: 99, username: "bot" }),
+      setMyCommands: async () => true,
+      getUpdates: async () => {
+        pollCount += 1;
+        if (pollCount === 1) {
+          return [
+            {
+              update_id: 1,
+              message: {
+                message_id: 101,
+                media_group_id: "album-1",
+                chat: { id: -100, type: "group", title: "Ops" },
+                from: { id: 7, is_bot: false, first_name: "Dev", username: "dev" },
+                date: 1,
+                caption: "release notes",
+                photo: [
+                  { file_id: "img-1", file_unique_id: "img-1", width: 10, height: 10 },
+                ],
+              },
+            },
+            {
+              update_id: 2,
+              message: {
+                message_id: 102,
+                media_group_id: "album-1",
+                chat: { id: -100, type: "group", title: "Ops" },
+                from: { id: 7, is_bot: false, first_name: "Dev", username: "dev" },
+                date: 1,
+                photo: [
+                  { file_id: "img-2", file_unique_id: "img-2", width: 10, height: 10 },
+                ],
+              },
+            },
+          ];
+        }
+
+        if (pollCount === 2) {
+          await Bun.sleep(1250);
+          channel.stopReceiving();
+        }
+        return [];
+      },
+      getFile: async (fileId: string) => ({
+        file_id: fileId,
+        file_unique_id: fileId,
+        file_path: `photos/${fileId}.jpg`,
+      }),
+      getFileUrl: (filePath: string) => `https://files.example/${filePath}`,
+    };
+
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = mock(async () => new Response(new Uint8Array([1, 2, 3]), { status: 200 })) as unknown as typeof fetch;
+
+    const received: Array<{ text: string; fileUrls?: string[] }> = [];
+    try {
+      await channel.startReceiving(async (msg) => {
+        received.push({ text: msg.text, fileUrls: msg.fileUrls });
+      });
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+
+    expect(received).toHaveLength(1);
+    const inbound = received[0];
+    expect(inbound.fileUrls).toHaveLength(2);
+    expect(inbound.text).toContain("release notes");
+    expect(inbound.text).toContain(inbound.fileUrls![0]);
+    expect(inbound.text).toContain(inbound.fileUrls![1]);
+
+    await stat(inbound.fileUrls![0]);
+    await stat(inbound.fileUrls![1]);
+    await unlink(inbound.fileUrls![0]);
+    await unlink(inbound.fileUrls![1]);
   });
 });
