@@ -4,6 +4,7 @@ import { createChannel } from "../channel/factory";
 import type { Channel, ChannelChatId } from "../channel/types";
 import { daemonRequest } from "./client";
 import { ensureDaemon } from "./ensure-daemon";
+import type { WaitItemStatus, WaitItemUpdate, WaitStateEvent } from "../daemon/control-server";
 import { createRemoteRecoveryController } from "./remote-recovery";
 import { stripAnsiReadable } from "../utils/ansi";
 import { paths, ensureDirs } from "../config/paths";
@@ -55,6 +56,11 @@ export const __cliRunTestUtils = {
   resetParserState: () => {
     toolUseIdToName.clear();
     toolUseIdToInput.clear();
+    toolUseIdToWaitGroupKey.clear();
+    waitGroupKeyToExpectedItemKeys.clear();
+    waitGroupItemState.clear();
+    codexAgentIdToWaitGroupKey.clear();
+    codexAgentIdToTitle.clear();
     codexSessionIdToCommand.clear();
     kimiAssistantTextBuffer.length = 0;
     kimiAssistantThinkingBuffer.length = 0;
@@ -344,14 +350,16 @@ async function removeManifest(id: string): Promise<void> {
   await removeSessionManifest(id);
 }
 
-const SUPPORTED_COMMANDS: Record<string, string[]> = {
+const SUPPORTED_COMMANDS = {
   claude: ["claude"],
   codex: ["codex"],
   pi: ["pi"],
   omp: ["omp"],
   kimi: ["kimi"],
   gemini: ["gemini"],
-};
+} as const;
+
+type SupportedCommand = keyof typeof SUPPORTED_COMMANDS;
 
 // Minimum supported tool versions. Below these, touchgrass may not work correctly.
 const MIN_TOOL_VERSIONS: Record<string, string> = {
@@ -523,6 +531,8 @@ type ConversationEventInfo =
   | { kind: "question"; questions: unknown[] }
   | { kind: "toolCall"; call: ToolCallInfo }
   | { kind: "toolResult"; result: ToolResultInfo };
+type WaitStateEventInfo = WaitStateEvent;
+type WaitItemStatusInfo = WaitItemStatus;
 
 interface ParsedMessage {
   assistantText: string | null;
@@ -532,12 +542,18 @@ interface ParsedMessage {
   toolCalls: ToolCallInfo[];
   toolResults: ToolResultInfo[];
   backgroundJobEvents: BackgroundJobEventInfo[];
+  waitStateEvents: WaitStateEventInfo[];
   conversationEvents: ConversationEventInfo[];
 }
 
 // Map tool_use_id/call_id → tool name so we can label tool_results
 const toolUseIdToName = new Map<string, string>();
 const toolUseIdToInput = new Map<string, Record<string, unknown>>();
+const toolUseIdToWaitGroupKey = new Map<string, string>();
+const waitGroupKeyToExpectedItemKeys = new Map<string, Set<string>>();
+const waitGroupItemState = new Map<string, Map<string, { status?: WaitItemStatusInfo; detail?: string | null }>>();
+const codexAgentIdToWaitGroupKey = new Map<string, string>();
+const codexAgentIdToTitle = new Map<string, string>();
 const codexSessionIdToCommand = new Map<string, string>();
 
 const OMP_INLINE_PLAN_REVIEW_MAX_CHARS = 3500;
@@ -564,6 +580,7 @@ const EMPTY_PARSED: ParsedMessage = {
   toolCalls: [],
   toolResults: [],
   backgroundJobEvents: [],
+  waitStateEvents: [],
   conversationEvents: [],
 };
 
@@ -619,6 +636,419 @@ function mergeUrls(primary?: string[], secondary?: string[]): string[] | undefin
   for (const url of secondary || []) merged.add(url);
   if (merged.size === 0) return undefined;
   return Array.from(merged).slice(0, 3);
+}
+
+const WAIT_TERMINAL_STATUSES = new Set<WaitItemStatusInfo>(["completed", "failed", "blocked"]);
+
+function extractFirstString(
+  record: Record<string, unknown> | null | undefined,
+  keys: string[]
+): string | undefined {
+  for (const key of keys) {
+    const value = record?.[key];
+    if (typeof value !== "string") continue;
+    const trimmed = value.trim();
+    if (trimmed) return trimmed;
+  }
+  return undefined;
+}
+
+function compactWaitDetail(text: string, max = 240): string | undefined {
+  const normalized = text
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .join(" ");
+  if (!normalized) return undefined;
+  return normalized.length > max ? `${normalized.slice(0, max - 3)}...` : normalized;
+}
+
+function waitDetailFromUnknown(value: unknown): string | undefined {
+  const text = extractTextFromContentPart(value);
+  if (text) return compactWaitDetail(text);
+  if (typeof value === "string") return compactWaitDetail(value);
+  if (value === undefined || value === null) return undefined;
+  try {
+    return compactWaitDetail(JSON.stringify(value));
+  } catch {
+    return undefined;
+  }
+}
+
+function normalizeWaitItemStatus(value: unknown): WaitItemStatusInfo | null {
+  if (typeof value !== "string") return null;
+  const normalized = value.trim().toLowerCase();
+  if (!normalized) return null;
+  if (normalized === "queued" || normalized === "pending" || normalized === "created") return "queued";
+  if (normalized === "running" || normalized === "started" || normalized === "start" || normalized === "in_progress" || normalized === "in-progress") return "running";
+  if (normalized === "completed" || normalized === "complete" || normalized === "done" || normalized === "success" || normalized === "succeeded" || normalized === "finished") return "completed";
+  if (normalized === "failed" || normalized === "error" || normalized === "errored") return "failed";
+  if (normalized === "blocked" || normalized === "aborted" || normalized === "cancelled" || normalized === "canceled" || normalized === "stopped" || normalized === "timed_out" || normalized === "timed-out" || normalized === "timeout") return "blocked";
+  return null;
+}
+
+function isTerminalWaitStatus(
+  status: WaitItemUpdate["status"] | null | undefined
+): status is WaitItemStatusInfo {
+  return !!status && WAIT_TERMINAL_STATUSES.has(status);
+}
+
+function buildWaitGroupKey(source: WaitStateEventInfo["cycleSource"], identity: string): string {
+  return `${source}:${identity}`;
+}
+
+function rememberWaitGroupItems(waitGroupKey: string, itemKeys: Iterable<string>): void {
+  const existing = waitGroupKeyToExpectedItemKeys.get(waitGroupKey) || new Set<string>();
+  for (const rawItemKey of itemKeys) {
+    const itemKey = rawItemKey.trim();
+    if (itemKey) existing.add(itemKey);
+  }
+  if (existing.size > 0) waitGroupKeyToExpectedItemKeys.set(waitGroupKey, existing);
+}
+
+function rememberWaitGroup(toolCallId: string, waitGroupKey: string, itemKeys?: Iterable<string>): void {
+  if (toolCallId) toolUseIdToWaitGroupKey.set(toolCallId, waitGroupKey);
+  if (itemKeys) rememberWaitGroupItems(waitGroupKey, itemKeys);
+}
+
+function forgetWaitGroup(waitGroupKey: string | undefined): void {
+  if (!waitGroupKey) return;
+  const stillTrackedByToolCall = Array.from(toolUseIdToWaitGroupKey.values()).some((value) => value === waitGroupKey);
+  const stillTrackedByCodexAgent = Array.from(codexAgentIdToWaitGroupKey.values()).some((value) => value === waitGroupKey);
+  if (!stillTrackedByToolCall && !stillTrackedByCodexAgent) {
+    waitGroupKeyToExpectedItemKeys.delete(waitGroupKey);
+    waitGroupItemState.delete(waitGroupKey);
+  }
+}
+
+function rememberWaitItemPatches(waitGroupKey: string, items: WaitItemUpdate[]): WaitItemUpdate[] {
+  const existing = waitGroupItemState.get(waitGroupKey) || new Map<string, { status?: WaitItemStatusInfo; detail?: string | null }>();
+  const normalizedItems = items.map((item) => {
+    const previous = existing.get(item.itemKey);
+    const shouldClearDetail = item.detail === undefined
+      && previous?.detail != null
+      && item.status !== undefined
+      && item.status !== "blocked"
+      && item.status !== "failed";
+    const normalized = shouldClearDetail ? { ...item, detail: null } : item;
+    const next = { ...(previous || {}) };
+    if (normalized.status !== undefined) next.status = normalized.status;
+    if (normalized.detail !== undefined) next.detail = normalized.detail;
+    existing.set(normalized.itemKey, next);
+    return normalized;
+  });
+  waitGroupItemState.set(waitGroupKey, existing);
+  return normalizedItems;
+}
+
+function canFinishWaitGroup(waitGroupKey: string): boolean {
+  const expectedItemKeys = waitGroupKeyToExpectedItemKeys.get(waitGroupKey);
+  const currentState = waitGroupItemState.get(waitGroupKey);
+  if (!currentState || currentState.size === 0) return false;
+  if (expectedItemKeys && expectedItemKeys.size > 0) {
+    return Array.from(expectedItemKeys).every((itemKey) => isTerminalWaitStatus(currentState.get(itemKey)?.status));
+  }
+  return Array.from(currentState.values()).every((item) => isTerminalWaitStatus(item.status));
+}
+
+function looksLikeCodexWaitStatusRecord(statusRecord: Record<string, unknown>): boolean {
+  const entries = Object.entries(statusRecord);
+  if (entries.length === 0) return false;
+  return entries.every(([agentId, value]) => {
+    if (!agentId.trim()) return false;
+    if (typeof value === "string") return true;
+    const record = asRecord(value);
+    if (!record) return false;
+    return Object.keys(record).every((key) => ["completed", "failed", "blocked", "status", "state", "message", "detail", "details", "error"].includes(key));
+  });
+}
+
+function looksLikeCodexWaitResult(result: Record<string, unknown>): boolean {
+  const keys = Object.keys(result);
+  if (keys.length === 0 || keys.some((key) => key !== "status" && key !== "timed_out")) return false;
+  if (typeof result.timed_out !== "boolean") return false;
+  const statusRecord = asRecord(result.status);
+  return !!statusRecord && (Object.keys(statusRecord).length === 0 || looksLikeCodexWaitStatusRecord(statusRecord));
+}
+
+function normalizeOmpTaskResultStatus(
+  result: Record<string, unknown>,
+  isError: boolean
+): WaitItemStatusInfo | null {
+  const structuredStatus = normalizeWaitItemStatus(result.status);
+  if (structuredStatus) return structuredStatus;
+  if (result.aborted === true) return "blocked";
+  const exitCodeValue = result.exitCode;
+  const exitCode = typeof exitCodeValue === "number"
+    ? exitCodeValue
+    : typeof exitCodeValue === "string" && exitCodeValue.trim()
+    ? Number(exitCodeValue)
+    : NaN;
+  if (Number.isFinite(exitCode)) return exitCode === 0 ? "completed" : "failed";
+  return isError ? "failed" : null;
+}
+
+function buildOmpTaskWaitStateFromToolCall(
+  toolName: string,
+  toolId: string,
+  input: Record<string, unknown>
+): WaitStateEventInfo[] {
+  if (toolName !== "task" || !toolId) return [];
+  const rawTasks = Array.isArray(input.tasks) ? input.tasks : [];
+  const items = rawTasks.flatMap((task) => {
+    const record = asRecord(task);
+    if (!record) return [];
+    const itemKey = extractFirstString(record, ["id", "taskId", "task_id"]);
+    if (!itemKey) return [];
+    const title = extractFirstString(record, ["description", "title", "name", "task"]);
+    const agentId = extractFirstString(record, ["agentId", "agent_id"]);
+    return [{
+      itemKey,
+      ...(title ? { title } : {}),
+      ...(agentId ? { agentId } : {}),
+      status: "queued" as const,
+    }];
+  });
+  if (items.length === 0) return [];
+  const waitGroupKey = buildWaitGroupKey("omp-task", toolId);
+  rememberWaitGroup(toolId, waitGroupKey, items.map((item) => item.itemKey));
+  const patches = rememberWaitItemPatches(waitGroupKey, items);
+  return [{
+    cycleSource: "omp-task",
+    waitGroupKey,
+    phase: "startOrUpdate",
+    items: patches,
+  }];
+}
+
+function buildOmpTaskWaitStateFromToolResult(
+  toolName: string,
+  toolCallId: string,
+  details: Record<string, unknown> | null,
+  text: string,
+  isError: boolean
+): WaitStateEventInfo[] {
+  if (toolName !== "task" || !toolCallId) return [];
+  const results = Array.isArray(details?.results) ? details.results : [];
+  if (results.length === 0) return [];
+  const waitGroupKey = toolUseIdToWaitGroupKey.get(toolCallId) || buildWaitGroupKey("omp-task", toolCallId);
+  const items: WaitItemUpdate[] = [];
+  for (const rawResult of results) {
+    const result = asRecord(rawResult);
+    if (!result) continue;
+    const itemKey = extractFirstString(result, ["taskId", "task_id", "id"]);
+    if (!itemKey) continue;
+    const status = normalizeOmpTaskResultStatus(result, isError);
+    if (!status) continue;
+    const title = extractFirstString(result, ["description", "title", "name"]);
+    const agentId = extractFirstString(result, ["agentId", "agent_id", "id"]);
+    const detail = waitDetailFromUnknown(result.output)
+      || compactWaitDetail(extractFirstString(result, ["summary", "message"]) || "");
+    items.push({
+      itemKey,
+      ...(title ? { title } : {}),
+      ...(agentId ? { agentId } : {}),
+      status,
+      ...(detail ? { detail } : {}),
+    });
+  }
+  if (items.length === 0) return [];
+  rememberWaitGroup(toolCallId, waitGroupKey, items.map((item) => item.itemKey));
+  const patches = rememberWaitItemPatches(waitGroupKey, items);
+  const phase = canFinishWaitGroup(waitGroupKey) ? "finish" : "startOrUpdate";
+  const summary = phase === "finish" ? extractTaskNotificationTag(text, "task-summary") : undefined;
+  return [{
+    cycleSource: "omp-task",
+    waitGroupKey,
+    phase,
+    items: patches,
+    ...(summary ? { summary } : {}),
+  }];
+}
+
+function extractClaudeTaskTitleFromInput(input: Record<string, unknown> | undefined): string | undefined {
+  if (!input) return undefined;
+  return extractFirstString(input, ["description", "message", "prompt", "task", "title"]);
+}
+
+function resolveKnownWaitItemKey(
+  waitGroupKey: string,
+  preferred?: string
+): string | undefined {
+  if (preferred) return preferred;
+  const expected = waitGroupKeyToExpectedItemKeys.get(waitGroupKey);
+  if (!expected || expected.size !== 1) return undefined;
+  return Array.from(expected)[0];
+}
+
+function extractClaudeTaskResultDetail(content: string): string | undefined {
+  const line = content
+    .split("\n")
+    .map((value) => value.trim())
+    .find((value) => value
+      && !/^agentId:/i.test(value)
+      && !/^<usage>/i.test(value)
+      && !/^tool_uses:/i.test(value)
+      && !/^duration_ms:/i.test(value)
+      && !/^total_tokens:/i.test(value));
+  return line ? compactWaitDetail(line, 320) : undefined;
+}
+
+function buildClaudeTaskWaitStateFromToolResult(
+  toolUseId: string,
+  toolName: string,
+  text: string,
+  isError: boolean
+): WaitStateEventInfo[] {
+  if (toolName !== "Task" || !toolUseId) return [];
+  const waitGroupKey = toolUseIdToWaitGroupKey.get(toolUseId) || buildWaitGroupKey("claude-task", toolUseId);
+  const cachedInput = toolUseIdToInput.get(toolUseId);
+  const title = extractClaudeTaskTitleFromInput(cachedInput);
+  const agentId = text.match(/agentId:\s*([A-Za-z0-9-]+)/i)?.[1];
+  if (/Async agent launched successfully/i.test(text)) {
+    if (!agentId) return [];
+    rememberWaitGroup(toolUseId, waitGroupKey, [agentId]);
+    const patches = rememberWaitItemPatches(waitGroupKey, [{
+      itemKey: agentId,
+      ...(title ? { title } : {}),
+      agentId,
+      status: "running",
+    }]);
+    return [{
+      cycleSource: "claude-task",
+      waitGroupKey,
+      phase: "startOrUpdate",
+      items: patches,
+    }];
+  }
+  const detail = extractClaudeTaskResultDetail(text);
+  const itemKey = resolveKnownWaitItemKey(waitGroupKey, agentId);
+  if (!itemKey) return [];
+  const hasUsageTail = /<usage>|total_tokens:|duration_ms:/i.test(text);
+  if (!isError && !hasUsageTail) return [];
+  const patches = rememberWaitItemPatches(waitGroupKey, [{
+    itemKey,
+    ...(title ? { title } : {}),
+    ...(agentId ? { agentId } : {}),
+    status: isError ? "failed" : "completed",
+    ...(detail ? { detail } : {}),
+  }]);
+  return [{
+    cycleSource: "claude-task",
+    waitGroupKey,
+    phase: "finish",
+    items: patches,
+  }];
+}
+
+function buildCodexWaitItemUpdate(agentId: string, statusValue: unknown): WaitItemUpdate | null {
+  let status: WaitItemStatusInfo | null = null;
+  let detail: string | undefined;
+
+  if (typeof statusValue === "string") {
+    status = normalizeWaitItemStatus(statusValue);
+    detail = status ? undefined : compactWaitDetail(statusValue);
+    if (!status && detail && /^blocked\b/i.test(detail)) status = "blocked";
+  } else {
+    const record = asRecord(statusValue);
+    if (!record) return null;
+
+    const blockedDetail = extractFirstString(record, ["blocked"]);
+    if (blockedDetail) {
+      status = "blocked";
+      detail = compactWaitDetail(blockedDetail);
+    }
+
+    if (!status) {
+      const failedDetail = extractFirstString(record, ["failed", "error"]);
+      if (failedDetail) {
+        status = "failed";
+        detail = compactWaitDetail(failedDetail);
+      }
+    }
+
+    if (!status && Object.prototype.hasOwnProperty.call(record, "completed")) {
+      const completedValue = record.completed;
+      const completedDetail = completedValue === true ? undefined : waitDetailFromUnknown(completedValue);
+      if (completedDetail && /^blocked\b/i.test(completedDetail)) {
+        status = "blocked";
+        detail = completedDetail;
+      } else {
+        status = "completed";
+        detail = completedDetail;
+      }
+    }
+
+    if (!status) {
+      const structuredStatus = extractFirstString(record, ["status", "state"]);
+      status = normalizeWaitItemStatus(structuredStatus);
+    }
+    if (!detail) {
+      detail = compactWaitDetail(extractFirstString(record, ["message", "detail", "details"]) || "");
+    }
+  }
+
+  if (!status) return null;
+  return {
+    itemKey: agentId,
+    agentId,
+    status,
+    ...(detail ? { detail } : {}),
+  };
+}
+
+
+function buildCodexWaitStateFromToolResult(
+  callId: string,
+  toolName: string,
+  input: Record<string, unknown> | undefined,
+  output: string
+): WaitStateEventInfo[] {
+  const parsed = parseJsonObject(output);
+  if (toolName === "spawn_agent") {
+    if (!parsed) return [];
+    const agentId = extractFirstString(parsed, ["agent_id", "agentId", "id"]);
+    if (!agentId) return [];
+    rememberCodexAgentTitle(agentId, extractFirstString(input, ["message", "prompt", "description"]));
+    return [];
+  }
+
+  if (!parsed) return [];
+  const statusRecord = asRecord(parsed.status);
+  const isExplicitWaitResult = toolName === "wait";
+  const isResumedWaitFallback = !toolName && looksLikeCodexWaitResult(parsed);
+  if (!statusRecord || (!isExplicitWaitResult && !isResumedWaitFallback)) return [];
+
+  const grouped = new Map<string, WaitItemUpdate[]>();
+  for (const [agentId, statusValue] of Object.entries(statusRecord)) {
+    const fallbackWaitGroupKey = isResumedWaitFallback
+      ? buildWaitGroupKey("codex-subagent", agentId)
+      : callId
+      ? buildWaitGroupKey("codex-subagent", callId)
+      : buildWaitGroupKey("codex-subagent", agentId);
+    const waitGroupKey = codexAgentIdToWaitGroupKey.get(agentId) || fallbackWaitGroupKey;
+    rememberWaitGroup(callId, waitGroupKey, [agentId]);
+    rememberCodexAgentWaitGroup(agentId, waitGroupKey);
+    const update = buildCodexWaitItemUpdate(agentId, statusValue);
+    if (!update) continue;
+    const title = codexAgentIdToTitle.get(agentId);
+    const existing = grouped.get(waitGroupKey) || [];
+    existing.push(title ? { ...update, title } : update);
+    grouped.set(waitGroupKey, existing);
+  }
+
+  const events: WaitStateEventInfo[] = [];
+  for (const [waitGroupKey, items] of grouped) {
+    if (items.length === 0) continue;
+    const patches = rememberWaitItemPatches(waitGroupKey, items);
+    events.push({
+      cycleSource: "codex-subagent",
+      waitGroupKey,
+      phase: canFinishWaitGroup(waitGroupKey) ? "finish" : "startOrUpdate",
+      items: patches,
+    });
+  }
+  return events;
 }
 
 function extractStoppedTaskFromResult(
@@ -685,6 +1115,16 @@ function detectCodexExitStatus(output: string): BackgroundJobEventInfo["status"]
     return "killed";
   }
   return null;
+}
+
+function parseJsonObject(content: string): Record<string, unknown> | null {
+  const trimmed = content.trim();
+  if (!trimmed.startsWith("{") || !trimmed.endsWith("}")) return null;
+  try {
+    return asRecord(JSON.parse(trimmed));
+  } catch {
+    return null;
+  }
 }
 
 function asRecord(value: unknown): Record<string, unknown> | null {
@@ -842,6 +1282,7 @@ function parseJsonlMessage(msg: Record<string, unknown>, sourceFilePath?: string
     let questions: unknown[] | null = null;
     const toolCalls: ToolCallInfo[] = [];
     const conversationEvents: ConversationEventInfo[] = [];
+    const waitStateEvents: WaitStateEventInfo[] = [];
     let pendingText: string[] = [];
     let pendingThinking: string[] = [];
     const flushText = () => {
@@ -897,7 +1338,17 @@ function parseJsonlMessage(msg: Record<string, unknown>, sourceFilePath?: string
     capIdMap();
     const assistantText = texts.join("\n").trim() || null;
     const thinking = thinkings.join("\n").trim() || null;
-    return { assistantText, assistantArtifact: null, thinking, questions, toolCalls, toolResults: [], backgroundJobEvents: [], conversationEvents };
+    return {
+      assistantText,
+      assistantArtifact: null,
+      thinking,
+      questions,
+      toolCalls,
+      toolResults: [],
+      backgroundJobEvents: [],
+      waitStateEvents,
+      conversationEvents,
+    };
   }
 
   // Kimi wire.jsonl format — {"timestamp": ..., "message": {"type": "...", "payload": {...}}}
@@ -920,6 +1371,7 @@ function parseJsonlMessage(msg: Record<string, unknown>, sourceFilePath?: string
         toolCalls: [],
         toolResults: [],
         backgroundJobEvents: [],
+        waitStateEvents: [],
         conversationEvents: buildBufferedConversationEvents(assistantText, thinking),
       };
     }
@@ -1031,6 +1483,7 @@ function parseJsonlMessage(msg: Record<string, unknown>, sourceFilePath?: string
       let questions: unknown[] | null = null;
       const toolCalls: ToolCallInfo[] = [];
       const conversationEvents: ConversationEventInfo[] = [];
+      const waitStateEvents: WaitStateEventInfo[] = [];
       let pendingText: string[] = [];
       let pendingThinking: string[] = [];
       const flushText = () => {
@@ -1077,6 +1530,7 @@ function parseJsonlMessage(msg: Record<string, unknown>, sourceFilePath?: string
               toolCalls.push(call);
               conversationEvents.push({ kind: "toolCall", call });
             }
+            waitStateEvents.push(...buildOmpTaskWaitStateFromToolCall(name, toolId, input));
             break;
           }
         }
@@ -1086,11 +1540,22 @@ function parseJsonlMessage(msg: Record<string, unknown>, sourceFilePath?: string
       capIdMap();
       const assistantText = texts.join("\n").trim() || null;
       const thinking = thinkings.join("\n").trim() || null;
-      return { assistantText, assistantArtifact: null, thinking, questions, toolCalls, toolResults: [], backgroundJobEvents: [], conversationEvents };
+      return {
+        assistantText,
+        assistantArtifact: null,
+        thinking,
+        questions,
+        toolCalls,
+        toolResults: [],
+        backgroundJobEvents: [],
+        waitStateEvents,
+        conversationEvents,
+      };
     }
 
     if (m.role === "toolResult") {
-      const toolName = (m.toolName as string) || toolUseIdToName.get(m.toolCallId as string) || "";
+      const toolCallId = typeof m.toolCallId === "string" ? m.toolCallId : "";
+      const toolName = (m.toolName as string) || toolUseIdToName.get(toolCallId) || "";
       const isError = m.isError === true;
       const content = m.content as Array<{ type: string; text?: string }> | undefined;
       const text = (content || [])
@@ -1099,9 +1564,11 @@ function parseJsonlMessage(msg: Record<string, unknown>, sourceFilePath?: string
         .join("\n")
         .trim();
       if (isError && isToolRejection(text)) return EMPTY_PARSED;
-      if (!text) return EMPTY_PARSED;
+      const details = asRecord(m.details);
+      const waitStateEvents = buildOmpTaskWaitStateFromToolResult(toolName, toolCallId, details, text, isError);
+      if (!text && waitStateEvents.length === 0) return EMPTY_PARSED;
       if (!isError && toolName === "exit_plan_mode") {
-        const planReview = buildOmpPlanReviewOutcome(asRecord(m.details), sourceFilePath);
+        const planReview = buildOmpPlanReviewOutcome(details, sourceFilePath);
         const assistantText = planReview?.text || text;
         const assistantArtifact = planReview?.artifactPath ? { path: planReview.artifactPath, caption: "Plan review artifact" } : null;
         const conversationEvents: ConversationEventInfo[] = [];
@@ -1114,9 +1581,18 @@ function parseJsonlMessage(msg: Record<string, unknown>, sourceFilePath?: string
           conversationEvents,
         };
       }
-      if (!isError && !FORWARD_RESULT_TOOLS.has(toolName)) return EMPTY_PARSED;
-      const result = { toolName: toolName || "unknown", content: text, isError };
-      return { ...EMPTY_PARSED, toolResults: [result], conversationEvents: [{ kind: "toolResult", result }] };
+      const shouldForwardToolResult = isError || FORWARD_RESULT_TOOLS.has(toolName);
+      if (!shouldForwardToolResult && waitStateEvents.length === 0) return EMPTY_PARSED;
+      const toolResults = text && shouldForwardToolResult
+        ? [{ toolName: toolName || "unknown", content: text, isError }]
+        : [];
+      if (toolResults.length === 0 && waitStateEvents.length === 0) return EMPTY_PARSED;
+      return {
+        ...EMPTY_PARSED,
+        toolResults,
+        waitStateEvents,
+        conversationEvents: toolResults.map((result) => ({ kind: "toolResult", result })),
+      };
     }
 
     return EMPTY_PARSED;
@@ -1129,6 +1605,7 @@ function parseJsonlMessage(msg: Record<string, unknown>, sourceFilePath?: string
     const content = m.content as Array<Record<string, unknown>>;
     const toolResults: ToolResultInfo[] = [];
     const backgroundJobEvents: BackgroundJobEventInfo[] = [];
+    const waitStateEvents: WaitStateEventInfo[] = [];
     const conversationEvents: ConversationEventInfo[] = [];
     const seenBackgroundIds = new Set<string>();
     const rootToolUseResult = msg.toolUseResult as Record<string, unknown> | undefined;
@@ -1152,6 +1629,7 @@ function parseJsonlMessage(msg: Record<string, unknown>, sourceFilePath?: string
       }
       if (isError && isToolRejection(text)) continue;
       const trimmedText = text.trim();
+      waitStateEvents.push(...buildClaudeTaskWaitStateFromToolResult(toolUseId, toolName, trimmedText, isError));
 
       const commandInput = toolUseIdToInput.get(toolUseId);
       const command = typeof commandInput?.command === "string" ? commandInput.command : undefined;
@@ -1192,8 +1670,8 @@ function parseJsonlMessage(msg: Record<string, unknown>, sourceFilePath?: string
         });
       }
     }
-    if (toolResults.length === 0 && backgroundJobEvents.length === 0) return EMPTY_PARSED;
-    return { ...EMPTY_PARSED, toolResults, backgroundJobEvents, conversationEvents };
+    if (toolResults.length === 0 && backgroundJobEvents.length === 0 && waitStateEvents.length === 0) return EMPTY_PARSED;
+    return { ...EMPTY_PARSED, toolResults, backgroundJobEvents, waitStateEvents, conversationEvents };
   }
 
   // Claude queue notifications for background job lifecycle
@@ -1259,7 +1737,32 @@ function parseJsonlMessage(msg: Record<string, unknown>, sourceFilePath?: string
       if (callId) toolUseIdToInput.set(callId, input);
       capIdMap();
       const call = { id: callId, name: payload.name, input };
-      return { ...EMPTY_PARSED, toolCalls: [call], conversationEvents: [{ kind: "toolCall", call }] };
+      const ids = payload.name === "wait" && Array.isArray(input.ids)
+        ? input.ids.filter((id): id is string => typeof id === "string" && id.trim().length > 0)
+        : [];
+      const waitStateEvents = payload.name === "wait" && callId && ids.length > 0
+        ? (() => {
+            const waitGroupKey = buildWaitGroupKey("codex-subagent", callId);
+            rememberWaitGroup(callId, waitGroupKey, ids);
+            const patches = rememberWaitItemPatches(waitGroupKey, ids.map((agentId) => {
+              rememberCodexAgentWaitGroup(agentId, waitGroupKey);
+              const title = codexAgentIdToTitle.get(agentId);
+              return {
+                itemKey: agentId,
+                ...(title ? { title } : {}),
+                agentId,
+                status: "running" as const,
+              };
+            }));
+            return [{
+              cycleSource: "codex-subagent" as const,
+              waitGroupKey,
+              phase: "startOrUpdate" as const,
+              items: patches,
+            }];
+          })()
+        : [];
+      return { ...EMPTY_PARSED, toolCalls: [call], waitStateEvents, conversationEvents: [{ kind: "toolCall", call }] };
     }
 
     if (payload.type === "custom_tool_call" && typeof payload.name === "string") {
@@ -1283,6 +1786,7 @@ function parseJsonlMessage(msg: Record<string, unknown>, sourceFilePath?: string
       if (!trimmedOutput) return EMPTY_PARSED;
 
       const backgroundJobEvents: BackgroundJobEventInfo[] = [];
+      const waitStateEvents = buildCodexWaitStateFromToolResult(callId, toolName, input, trimmedOutput);
 
       if (toolName === "exec_command" || toolName === "write_stdin") {
         const sessionIdFromOutput = trimmedOutput.match(/Process running with session ID\s*([0-9]+)/i)?.[1];
@@ -1328,11 +1832,12 @@ function parseJsonlMessage(msg: Record<string, unknown>, sourceFilePath?: string
         toolResults.push({ toolName: toolName || "unknown", content: trimmedOutput, isError: false });
       }
 
-      if (toolResults.length === 0 && backgroundJobEvents.length === 0) return EMPTY_PARSED;
+      if (toolResults.length === 0 && backgroundJobEvents.length === 0 && waitStateEvents.length === 0) return EMPTY_PARSED;
       return {
         ...EMPTY_PARSED,
         toolResults,
         backgroundJobEvents,
+        waitStateEvents,
         conversationEvents: toolResults.map((result) => ({ kind: "toolResult", result })),
       };
     }
@@ -1341,17 +1846,63 @@ function parseJsonlMessage(msg: Record<string, unknown>, sourceFilePath?: string
   return EMPTY_PARSED;
 }
 
+function dropToolCallTracking(toolCallId: string): void {
+  const waitGroupKey = toolUseIdToWaitGroupKey.get(toolCallId);
+  toolUseIdToName.delete(toolCallId);
+  toolUseIdToInput.delete(toolCallId);
+  toolUseIdToWaitGroupKey.delete(toolCallId);
+  forgetWaitGroup(waitGroupKey);
+}
+
+function dropCodexAgentTracking(agentId: string): void {
+  const waitGroupKey = codexAgentIdToWaitGroupKey.get(agentId);
+  codexAgentIdToWaitGroupKey.delete(agentId);
+  codexAgentIdToTitle.delete(agentId);
+  forgetWaitGroup(waitGroupKey);
+}
+
+function rememberCodexAgentWaitGroup(agentId: string, waitGroupKey: string): void {
+  if (!agentId) return;
+  codexAgentIdToWaitGroupKey.set(agentId, waitGroupKey);
+  capCodexAgentMaps();
+}
+
+function rememberCodexAgentTitle(agentId: string, title: string | undefined): void {
+  if (!agentId || !title) return;
+  codexAgentIdToTitle.set(agentId, title);
+  capCodexAgentMaps();
+}
+
+function capCodexAgentMaps(): void {
+  while (codexAgentIdToWaitGroupKey.size > 200) {
+    const first = codexAgentIdToWaitGroupKey.keys().next().value as string | undefined;
+    if (!first) break;
+    dropCodexAgentTracking(first);
+  }
+  while (codexAgentIdToTitle.size > 200) {
+    const first = codexAgentIdToTitle.keys().next().value as string | undefined;
+    if (!first) break;
+    dropCodexAgentTracking(first);
+  }
+}
+
 function capIdMap() {
   while (toolUseIdToName.size > 200) {
-    const first = toolUseIdToName.keys().next().value!;
-    toolUseIdToName.delete(first);
-    toolUseIdToInput.delete(first);
+    const first = toolUseIdToName.keys().next().value as string | undefined;
+    if (!first) break;
+    dropToolCallTracking(first);
   }
   while (toolUseIdToInput.size > 200) {
-    const first = toolUseIdToInput.keys().next().value!;
-    toolUseIdToInput.delete(first);
-    toolUseIdToName.delete(first);
+    const first = toolUseIdToInput.keys().next().value as string | undefined;
+    if (!first) break;
+    dropToolCallTracking(first);
   }
+  while (toolUseIdToWaitGroupKey.size > 200) {
+    const first = toolUseIdToWaitGroupKey.keys().next().value as string | undefined;
+    if (!first) break;
+    dropToolCallTracking(first);
+  }
+  capCodexAgentMaps();
 }
 
 // Write poll keypresses to the terminal to simulate user selection
@@ -1410,10 +1961,11 @@ function watchSessionFile(
   onThinking?: (text: string) => void,
   onToolResult?: (results: ToolResultInfo[]) => void,
   onBackgroundJobEvent?: (events: BackgroundJobEventInfo[]) => void,
+  onWaitStateEvent?: (events: WaitStateEventInfo[]) => void,
   onMessageParsed?: (msg: Record<string, unknown>) => void,
   startFromEnd?: boolean,
   onConversationEvent?: (event: ConversationEventInfo) => void,
-): FSWatcher {
+ ): FSWatcher {
   // For resumed sessions, skip existing content — only watch new writes
   let byteOffset = 0;
   if (startFromEnd) {
@@ -1495,6 +2047,9 @@ function watchSessionFile(
             }
             if (onBackgroundJobEvent && parsed.backgroundJobEvents.length > 0) {
               onBackgroundJobEvent(parsed.backgroundJobEvents);
+            }
+            if (onWaitStateEvent && parsed.waitStateEvents.length > 0) {
+              onWaitStateEvent(parsed.waitStateEvents);
             }
           } catch {} // skip malformed JSONL lines
         }
@@ -2462,6 +3017,20 @@ export async function runRun(): Promise<void> {
           return remoteConversationQueue;
         }
       : null;
+    let remoteWaitStateQueue = Promise.resolve();
+    const enqueueRemoteWaitStateEvent = remoteId
+      ? (event: WaitStateEventInfo) => {
+          remoteWaitStateQueue = remoteWaitStateQueue
+            .catch(() => {})
+            .then(async () => {
+              const payload = asRecord(event);
+              if (!payload) return;
+              await daemonRequest(`/remote/${remoteId}/wait-state`, "POST", payload);
+            })
+            .catch(() => {});
+          return remoteWaitStateQueue;
+        }
+      : null;
     const onApprovalPrompt = enqueueRemoteConversationEvent
       ? (promptText: string, pollOptions?: string[]) => {
           enqueueRemoteConversationEvent({
@@ -2604,6 +3173,13 @@ export async function runRun(): Promise<void> {
               }
             }
           : undefined;
+        const onWaitStateEvent = tgRemoteId && enqueueRemoteWaitStateEvent
+          ? (events: WaitStateEventInfo[]) => {
+              for (const event of events) {
+                enqueueRemoteWaitStateEvent(event).catch(() => {});
+              }
+            }
+          : undefined;
         const onAssistant = (text: string) => {
           // Reset so we can catch the same prompt again if the tool asks it multiple times
           lastNotifiedPrompt = "";
@@ -2656,6 +3232,7 @@ export async function runRun(): Promise<void> {
             undefined,
             undefined,
             onBackgroundJobEvent,
+            onWaitStateEvent,
             (msg) => {
               if (typeof msg.sessionId === "string") activeClaudeSessionId = msg.sessionId;
             },
@@ -2807,10 +3384,10 @@ export async function runRun(): Promise<void> {
           logErr: () => {},
         })
       : null;
+    const getRecoveryName = (): string | undefined => {
+      return remoteId ? readSessionManifestSync(remoteId)?.name ?? manifest?.name : manifest?.name;
+    };
     if (remoteId && chatId && ownerUserId && recovery) {
-      const getRecoveryName = (): string | undefined => {
-        return readSessionManifestSync(remoteId)?.name ?? manifest?.name;
-      };
 
       pollTimer = setInterval(async () => {
         if (processingInput || recovery.isRecovering()) return;

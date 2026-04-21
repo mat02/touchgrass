@@ -683,4 +683,367 @@ describe("background job parser", () => {
       },
     ]);
   });
+  it("emits OMP task wait lifecycles from explicit task tool calls and results", () => {
+    __cliRunTestUtils.resetParserState();
+
+    const started = __cliRunTestUtils.parseJsonlMessage({
+      type: "message",
+      message: {
+        role: "assistant",
+        content: [
+          {
+            type: "toolCall",
+            id: "omp-task-1",
+            name: "task",
+            arguments: {
+              tasks: [
+                { id: "child-1", description: "Investigate failing alert" },
+                { id: "child-2", title: "Prepare rollback" },
+              ],
+            },
+          },
+        ],
+      },
+    });
+
+    expect(started.waitStateEvents).toEqual([
+      {
+        cycleSource: "omp-task",
+        waitGroupKey: "omp-task:omp-task-1",
+        phase: "startOrUpdate",
+        items: [
+          { itemKey: "child-1", title: "Investigate failing alert", status: "queued" },
+          { itemKey: "child-2", title: "Prepare rollback", status: "queued" },
+        ],
+      },
+    ]);
+
+    const partial = __cliRunTestUtils.parseJsonlMessage({
+      type: "message",
+      message: {
+        role: "toolResult",
+        toolCallId: "omp-task-1",
+        toolName: "task",
+        isError: false,
+        content: [{ type: "text", text: "partial results" }],
+        details: {
+          results: [
+            { taskId: "child-1", description: "Investigate failing alert", exitCode: 0, output: "Found root cause" },
+            { taskId: "child-2", title: "Prepare rollback", status: "running", summary: "Waiting for approval" },
+          ],
+        },
+      },
+    });
+
+    expect(partial.waitStateEvents).toEqual([
+      {
+        cycleSource: "omp-task",
+        waitGroupKey: "omp-task:omp-task-1",
+        phase: "startOrUpdate",
+        items: [
+          { itemKey: "child-1", title: "Investigate failing alert", status: "completed", detail: "Found root cause" },
+          { itemKey: "child-2", title: "Prepare rollback", status: "running", detail: "Waiting for approval" },
+        ],
+      },
+    ]);
+
+    const finished = __cliRunTestUtils.parseJsonlMessage({
+      type: "message",
+      message: {
+        role: "toolResult",
+        toolCallId: "omp-task-1",
+        toolName: "task",
+        isError: false,
+        content: [{ type: "text", text: "<task-summary>All child tasks done</task-summary>" }],
+        details: {
+          results: [
+            { taskId: "child-2", title: "Prepare rollback", exitCode: 0, output: "Rollback staged" },
+          ],
+        },
+      },
+    });
+
+    expect(finished.waitStateEvents).toEqual([
+      {
+        cycleSource: "omp-task",
+        waitGroupKey: "omp-task:omp-task-1",
+        phase: "finish",
+        items: [
+          { itemKey: "child-2", title: "Prepare rollback", status: "completed", detail: "Rollback staged" },
+        ],
+        summary: "All child tasks done",
+      },
+    ]);
+  });
+
+  it("emits Claude Task wait start and finish events keyed by agent identity", () => {
+    __cliRunTestUtils.resetParserState();
+
+    __cliRunTestUtils.parseJsonlMessage({
+      type: "assistant",
+      message: {
+        content: [
+          {
+            type: "tool_use",
+            id: "toolu_task_wait",
+            name: "Task",
+            input: { description: "Check latest HelpScout tickets" },
+          },
+        ],
+      },
+    });
+
+    const started = __cliRunTestUtils.parseJsonlMessage({
+      type: "user",
+      message: {
+        role: "user",
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: "toolu_task_wait",
+            is_error: false,
+            content: "Async agent launched successfully.\nagentId: agent-42",
+          },
+        ],
+      },
+    });
+
+    expect(started.waitStateEvents).toEqual([
+      {
+        cycleSource: "claude-task",
+        waitGroupKey: "claude-task:toolu_task_wait",
+        phase: "startOrUpdate",
+        items: [
+          {
+            itemKey: "agent-42",
+            title: "Check latest HelpScout tickets",
+            agentId: "agent-42",
+            status: "running",
+          },
+        ],
+      },
+    ]);
+
+    const finished = __cliRunTestUtils.parseJsonlMessage({
+      type: "user",
+      message: {
+        role: "user",
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: "toolu_task_wait",
+            is_error: true,
+            content: "Ticket API rate limit exceeded\nagentId: agent-42",
+          },
+        ],
+      },
+    });
+
+    expect(finished.waitStateEvents).toEqual([
+      {
+        cycleSource: "claude-task",
+        waitGroupKey: "claude-task:toolu_task_wait",
+        phase: "finish",
+        items: [
+          {
+            itemKey: "agent-42",
+            title: "Check latest HelpScout tickets",
+            agentId: "agent-42",
+            status: "failed",
+            detail: "Ticket API rate limit exceeded",
+          },
+        ],
+      },
+    ]);
+  });
+
+  it("emits Codex wait lifecycles for explicit wait calls", () => {
+    __cliRunTestUtils.resetParserState();
+
+    __cliRunTestUtils.parseJsonlMessage({
+      type: "response_item",
+      payload: {
+        type: "function_call",
+        name: "spawn_agent",
+        call_id: "call_spawn_wait",
+        arguments: JSON.stringify({ message: "Investigate the webhook backlog" }),
+      },
+    });
+    __cliRunTestUtils.parseJsonlMessage({
+      type: "response_item",
+      payload: {
+        type: "function_call_output",
+        call_id: "call_spawn_wait",
+        output: JSON.stringify({ agent_id: "agent-wait-1" }),
+      },
+    });
+
+    const started = __cliRunTestUtils.parseJsonlMessage({
+      type: "response_item",
+      payload: {
+        type: "function_call",
+        name: "wait",
+        call_id: "call_wait_1",
+        arguments: JSON.stringify({ ids: ["agent-wait-1"] }),
+      },
+    });
+
+    expect(started.waitStateEvents).toEqual([
+      {
+        cycleSource: "codex-subagent",
+        waitGroupKey: "codex-subagent:call_wait_1",
+        phase: "startOrUpdate",
+        items: [
+          {
+            itemKey: "agent-wait-1",
+            title: "Investigate the webhook backlog",
+            agentId: "agent-wait-1",
+            status: "running",
+          },
+        ],
+      },
+    ]);
+
+    const finished = __cliRunTestUtils.parseJsonlMessage({
+      type: "response_item",
+      payload: {
+        type: "function_call_output",
+        call_id: "call_wait_1",
+        output: JSON.stringify({
+          status: { "agent-wait-1": { completed: "Webhook queue drained" } },
+          timed_out: false,
+        }),
+      },
+    });
+
+    expect(finished.waitStateEvents).toEqual([
+      {
+        cycleSource: "codex-subagent",
+        waitGroupKey: "codex-subagent:call_wait_1",
+        phase: "finish",
+        items: [
+          {
+            itemKey: "agent-wait-1",
+            title: "Investigate the webhook backlog",
+            agentId: "agent-wait-1",
+            status: "completed",
+            detail: "Webhook queue drained",
+          },
+        ],
+      },
+    ]);
+  });
+
+  it("falls back to resumed Codex wait outputs when prior wait metadata is unavailable", () => {
+    __cliRunTestUtils.resetParserState();
+
+    const parsed = __cliRunTestUtils.parseJsonlMessage({
+      type: "response_item",
+      payload: {
+        type: "function_call_output",
+        call_id: "resume-only-output",
+        output: JSON.stringify({
+          status: {
+            "agent-finished": { completed: true },
+            "agent-failed": { failed: "Timed out contacting backend" },
+          },
+          timed_out: false,
+        }),
+      },
+    });
+
+    expect(parsed.waitStateEvents).toEqual([
+      {
+        cycleSource: "codex-subagent",
+        waitGroupKey: "codex-subagent:agent-finished",
+        phase: "finish",
+        items: [
+          { itemKey: "agent-finished", agentId: "agent-finished", status: "completed" },
+        ],
+      },
+      {
+        cycleSource: "codex-subagent",
+        waitGroupKey: "codex-subagent:agent-failed",
+        phase: "finish",
+        items: [
+          {
+            itemKey: "agent-failed",
+            agentId: "agent-failed",
+            status: "failed",
+            detail: "Timed out contacting backend",
+          },
+        ],
+      },
+    ]);
+  });
+
+  it("applies later Codex metadata after a resume-only finish output", () => {
+    __cliRunTestUtils.resetParserState();
+
+    const resumed = __cliRunTestUtils.parseJsonlMessage({
+      type: "response_item",
+      payload: {
+        type: "function_call_output",
+        call_id: "resume-only-output",
+        output: JSON.stringify({
+          status: { "agent-finished": { completed: true } },
+          timed_out: false,
+        }),
+      },
+    });
+
+    expect(resumed.waitStateEvents).toEqual([
+      {
+        cycleSource: "codex-subagent",
+        waitGroupKey: "codex-subagent:agent-finished",
+        phase: "finish",
+        items: [{ itemKey: "agent-finished", agentId: "agent-finished", status: "completed" }],
+      },
+    ]);
+
+    __cliRunTestUtils.parseJsonlMessage({
+      type: "response_item",
+      payload: {
+        type: "function_call",
+        name: "spawn_agent",
+        call_id: "call_spawn_after_resume",
+        arguments: JSON.stringify({ message: "Investigate the webhook backlog" }),
+      },
+    });
+    __cliRunTestUtils.parseJsonlMessage({
+      type: "response_item",
+      payload: {
+        type: "function_call_output",
+        call_id: "call_spawn_after_resume",
+        output: JSON.stringify({ agent_id: "agent-finished" }),
+      },
+    });
+
+    const started = __cliRunTestUtils.parseJsonlMessage({
+      type: "response_item",
+      payload: {
+        type: "function_call",
+        name: "wait",
+        call_id: "call_wait_after_resume",
+        arguments: JSON.stringify({ ids: ["agent-finished"] }),
+      },
+    });
+
+    expect(started.waitStateEvents).toEqual([
+      {
+        cycleSource: "codex-subagent",
+        waitGroupKey: "codex-subagent:call_wait_after_resume",
+        phase: "startOrUpdate",
+        items: [
+          {
+            itemKey: "agent-finished",
+            title: "Investigate the webhook backlog",
+            agentId: "agent-finished",
+            status: "running",
+          },
+        ],
+      },
+    ]);
+  });
+
 });

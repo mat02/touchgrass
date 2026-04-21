@@ -41,6 +41,24 @@ export type ConversationEvent =
   | { kind: "toolResult"; toolName: string; content: string; isError?: boolean }
   | { kind: "approvalNeeded"; name: string; input: Record<string, unknown>; promptText?: string; pollOptions?: string[] };
 
+export type WaitItemStatus = "queued" | "running" | "completed" | "failed" | "blocked";
+
+export interface WaitItemUpdate {
+  itemKey: string;
+  title?: string;
+  agentId?: string;
+  status?: WaitItemStatus;
+  detail?: string | null;
+}
+
+export interface WaitStateEvent {
+  cycleSource: "omp-task" | "claude-task" | "codex-subagent";
+  waitGroupKey: string;
+  phase: "startOrUpdate" | "finish";
+  items: WaitItemUpdate[];
+  summary?: string;
+}
+
 export interface DaemonContext {
   authToken: string;
   startedAt: number;
@@ -73,6 +91,7 @@ export interface DaemonContext {
       urls?: string[];
     }
   ) => void;
+  handleWaitState: (sessionId: string, event: WaitStateEvent) => void;
   getBackgroundJobs: (sessionId: string) => Array<{ taskId: string; status: string; command?: string; urls?: string[]; updatedAt: number }>;
   getAllBackgroundJobs: (cwd?: string) => Array<{ sessionId: string; command: string; cwd: string; jobs: Array<{ taskId: string; status: string; command?: string; urls?: string[]; updatedAt: number }> }>;
   sendMessageToSession: (sessionId: string, text: string) => Promise<{ ok: boolean; error?: string }>;
@@ -120,6 +139,70 @@ function isAuthorized(req: Request, expectedToken: string): boolean {
   const provided = req.headers.get("x-touchgrass-auth");
   if (!provided) return false;
   return constantTimeEqual(provided, expectedToken);
+}
+
+const WAIT_STATE_SOURCES = new Set<WaitStateEvent["cycleSource"]>([
+  "omp-task",
+  "claude-task",
+  "codex-subagent",
+]);
+const WAIT_STATE_PHASES = new Set<WaitStateEvent["phase"]>(["startOrUpdate", "finish"]);
+const WAIT_ITEM_STATUSES = new Set<WaitItemStatus>([
+  "queued",
+  "running",
+  "completed",
+  "failed",
+  "blocked",
+]);
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  return value as Record<string, unknown>;
+}
+
+function readOptionalString(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  return trimmed || undefined;
+}
+
+function parseWaitItemUpdate(body: Record<string, unknown>): WaitItemUpdate | null {
+  const itemKey = readOptionalString(body.itemKey);
+  if (!itemKey) return null;
+  const status = readOptionalString(body.status);
+  if (status && !WAIT_ITEM_STATUSES.has(status as WaitItemStatus)) return null;
+  const detail = body.detail === null ? null : readOptionalString(body.detail);
+  return {
+    itemKey,
+    ...(readOptionalString(body.title) ? { title: readOptionalString(body.title) } : {}),
+    ...(readOptionalString(body.agentId) ? { agentId: readOptionalString(body.agentId) } : {}),
+    ...(status ? { status: status as WaitItemStatus } : {}),
+    ...(detail !== undefined ? { detail } : {}),
+  };
+}
+
+function parseWaitStateEvent(body: Record<string, unknown>): WaitStateEvent | null {
+  const cycleSource = readOptionalString(body.cycleSource);
+  const waitGroupKey = readOptionalString(body.waitGroupKey);
+  const phase = readOptionalString(body.phase);
+  if (!cycleSource || !WAIT_STATE_SOURCES.has(cycleSource as WaitStateEvent["cycleSource"])) return null;
+  if (!waitGroupKey) return null;
+  if (!phase || !WAIT_STATE_PHASES.has(phase as WaitStateEvent["phase"])) return null;
+  if (!Array.isArray(body.items)) return null;
+  const items: WaitItemUpdate[] = [];
+  for (const rawItem of body.items) {
+    const parsed = parseWaitItemUpdate(asRecord(rawItem) || {});
+    if (!parsed) return null;
+    items.push(parsed);
+  }
+  const summary = readOptionalString(body.summary);
+  return {
+    cycleSource: cycleSource as WaitStateEvent["cycleSource"],
+    waitGroupKey,
+    phase: phase as WaitStateEvent["phase"],
+    items,
+    ...(summary ? { summary } : {}),
+  };
 }
 
 export async function startControlServer(ctx: DaemonContext): Promise<void> {
@@ -373,7 +456,7 @@ export async function startControlServer(ctx: DaemonContext): Promise<void> {
       }
 
       // Match /remote/:id/* actions
-      const remoteMatch = path.match(/^\/remote\/(r-[a-f0-9]+)\/(input|exit|subscribed-groups|conversation-event|typing|background-job|send-input|send-message)$/);
+      const remoteMatch = path.match(/^\/remote\/(r-[a-f0-9]+)\/(input|exit|subscribed-groups|conversation-event|typing|background-job|wait-state|send-input|send-message)$/);
       if (remoteMatch) {
         const [, sessionId, action] = remoteMatch;
         if (action === "conversation-event" && req.method === "POST") {
@@ -424,6 +507,15 @@ export async function startControlServer(ctx: DaemonContext): Promise<void> {
             return Response.json({ ok: false, error: "Missing taskId or status" }, { status: 400 });
           }
           ctx.handleBackgroundJob(sessionId, { taskId, status, command, outputFile, summary, urls });
+          return Response.json({ ok: true });
+        }
+        if (action === "wait-state" && req.method === "POST") {
+          const body = await readJsonBody(req);
+          const event = parseWaitStateEvent(body);
+          if (!event) {
+            return Response.json({ ok: false, error: "Invalid wait-state payload" }, { status: 400 });
+          }
+          ctx.handleWaitState(sessionId, event);
           return Response.json({ ok: true });
         }
         if (action === "typing" && req.method === "POST") {
