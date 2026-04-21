@@ -4,9 +4,9 @@ Use Telegram as a remote controller for Claude Code, Codex, Kimi, Pi, OMP, and m
 
 - **Zero config** — wraps your existing CLI tools, no new runtime to learn
 - **Works from your phone** — send prompts, approve tools, attach files from Telegram
-- **Multi-tool** — supports Claude Code, Codex, Pi, OMP, and Kimi out of the box
+- **Multi-tool** — supports Claude Code, Codex, Pi, OMP, Kimi, and Gemini out of the box
 - **Lightweight** — just a PTY bridge + daemon, auto-starts and auto-stops
-- **Fork additions** — improved Telegram output controls, better OMP tool formatting, and safer plan review delivery
+- **Fork additions** — improved Telegram output controls, better OMP/task tool formatting, and safer plan review delivery
 
 ## Table of Contents
 
@@ -36,9 +36,9 @@ They do not install upstream `touchgrass.sh` releases.
 
 ## Fork-specific changes
 
-- Added OMP session support (`touchgrass omp`) and improved compact Telegram rendering for OMP tool calls
+- Added OMP session support (`touchgrass omp`) plus improved compact Telegram rendering for OMP/tool-task notifications
 - Reworked Telegram output controls around `/output_mode` presets (`simple`, `thinking`, `verbose`) plus a guided custom wizard and granular setters
-- Kept assistant/control-plane updates always visible and improved long OMP plan reviews by sending an attachment when inline delivery would be too large
+- Kept assistant/control-plane updates always visible, improved long OMP plan reviews by sending an attachment when inline delivery would be too large, and coalesced Telegram media-group albums into one queued prompt
 
 ## Setup
 
@@ -62,7 +62,7 @@ touchgrass codex
 touchgrass pi
 touchgrass omp
 touchgrass kimi
-```
+touchgrass gemini
 
 You'll see a banner confirming the session is touchgrass-wrapped:
 
@@ -101,7 +101,7 @@ touchgrass codex --sandbox workspace-write --ask-for-approval untrusted
 
 Two processes cooperate:
 
-1. CLI process (`touchgrass claude` / `touchgrass codex` / `touchgrass pi` / `touchgrass omp` / `touchgrass kimi`):
+1. CLI process (`touchgrass claude` / `touchgrass codex` / `touchgrass pi` / `touchgrass omp` / `touchgrass kimi` / `touchgrass gemini`):
 - starts PTY
 - watches tool JSONL output (the session files for the CLIs)
 - sends output to selected chat destination
@@ -109,7 +109,7 @@ Two processes cooperate:
 2. Daemon:
 - auto-starts on demand
 - receives channel messages
-- routes input into the right session
+- queues inbound chat input and routes it into the right session in order
 - auto-stops after 30s idle
 
 ### Channels vs sessions
@@ -118,7 +118,7 @@ Two processes cooperate:
   Use: `touchgrass setup --list-channels`, `touchgrass setup --channel <name> --show`, `touchgrass setup --channel <name>`.
 - **Runtime chat channel**: a concrete DM/group/topic the daemon can route to right now.
   Use: `touchgrass channels`.
-- **Session**: a running bridged CLI process (`touchgrass claude`, `touchgrass codex`, `touchgrass pi`, `touchgrass omp`, `touchgrass kimi`) with an `r-...` id.
+- **Session**: a running bridged CLI process (`touchgrass claude`, `touchgrass codex`, `touchgrass pi`, `touchgrass omp`, `touchgrass kimi`, `touchgrass gemini`) with an `r-...` id.
   Use: `touchgrass ls`, `touchgrass stop <id>`, `touchgrass kill <id>`, `touchgrass send <id> ...`.
 
 ### Telegram commands
@@ -144,6 +144,7 @@ touchgrass codex [args]
 touchgrass pi [args]
 touchgrass omp [args]
 touchgrass kimi [args]
+touchgrass gemini [args]
 ```
 
 - `touchgrass claude [args]`: run Claude Code with touchgrass bridge.
@@ -151,6 +152,7 @@ touchgrass kimi [args]
 - `touchgrass pi [args]`: run PI with touchgrass bridge.
 - `touchgrass omp [args]`: run Oh My Pi with touchgrass bridge.
 - `touchgrass kimi [args]`: run Kimi with touchgrass bridge.
+- `touchgrass gemini [args]`: run Gemini with touchgrass bridge.
 
 ### Setup and health
 
@@ -196,11 +198,11 @@ touchgrass kill <id>
 
 ```bash
 touchgrass send <id> "continue"
-touchgrass send --file <id> ./notes.md
+touchgrass send <id> --file ./notes.md
 ```
 
 - `touchgrass send <id> "text"`: inject text input into a running session.
-- `touchgrass send --file <id> <path>`: send a local file to the linked channel for that session.
+- `touchgrass send <id> --file <path>`: send a local file to the linked channel for that session.
 
 ## FAQ
 
@@ -209,6 +211,13 @@ No. You still run the normal local terminal CLI; touchgrass only bridges the ses
 
 **Can I type locally and from chat at the same time?**
 Yes, but avoid simultaneous input bursts to prevent interleaving.
+
+**How are follow-up chat messages handled?**
+They are queued and forwarded into the same running terminal session in order. touchgrass does not stop the active session just because a new normal message arrives.
+
+**What happens when I send multiple images from Telegram at once?**
+Telegram media-group albums are coalesced into one queued prompt with all downloaded file paths, so a 2+ image send does not become multiple competing prompts.
+
 
 **Do the install scripts fetch from upstream touchgrass.sh?**
 No. The install commands in this README fetch the installer scripts from `mat02/touchgrass`, and those scripts download release binaries from this same repository’s GitHub releases.
@@ -220,7 +229,7 @@ No. This project is focused on remote terminal control only.
 
 - Bun runtime
 - Telegram account
-- Local Claude/Codex/PI/Kimi/OMP CLI installed
+- Local Claude/Codex/PI/Kimi/OMP/Gemini CLI installed
 
 ## License
 
