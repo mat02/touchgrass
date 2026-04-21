@@ -263,6 +263,7 @@ describe("daemon output controls", () => {
     });
     const scheduleNextQuestionPoll = __daemonTestUtils.createQuestionPollScheduler({
       getPendingQuestions: (sessionId) => pendingBySession.get(sessionId) ?? null,
+      hasActivePollForSession: () => false,
       isChatMutedForChat: () => false,
       enqueueOrderedConversationDelivery,
       sendNextPoll: async (_sessionId, sendOptions) => {
@@ -316,6 +317,7 @@ describe("daemon output controls", () => {
     });
     const scheduleNextQuestionPoll = __daemonTestUtils.createQuestionPollScheduler({
       getPendingQuestions: (sessionId) => pendingBySession.get(sessionId) ?? null,
+      hasActivePollForSession: () => false,
       isChatMutedForChat: () => false,
       enqueueOrderedConversationDelivery,
       sendNextPoll: async (sessionId) => {
@@ -347,6 +349,107 @@ describe("daemon output controls", () => {
     await slowFollowupGate;
     expect(calls).toEqual(["slow:first:start", "fast:first", "slow:first:end", "slow:followup"]);
   });
+  it("clears pending interactive state on local prompt submit and suppresses follow-up poll sends", async () => {
+    const pendingQuestionsBySession = new Map<string, { chatId: string }>([["session-1", { chatId: "telegram:1" }]]);
+    const pendingApprovalBySession = new Map<string, { chatId: string }>([["session-1", { chatId: "telegram:1" }]]);
+    const activePollBySession = new Map<string, { pollId: string; poll: { chatId: string; messageId: string } }>([
+      ["session-1", { pollId: "poll-1", poll: { chatId: "telegram:1", messageId: "msg-1" } }],
+    ]);
+    const removedPollIds: string[] = [];
+    const closedPolls: Array<{ chatId: string; messageId: string }> = [];
+    let sendCount = 0;
+
+    const enqueueOrderedConversationDelivery = __daemonTestUtils.createOrderedConversationQueue({
+      getTimeoutMs: () => 1000,
+      logSkip: async () => {},
+      onSkip: async () => {},
+    });
+    const scheduleNextQuestionPoll = __daemonTestUtils.createQuestionPollScheduler({
+      getPendingQuestions: (sessionId) => pendingQuestionsBySession.get(sessionId) ?? null,
+      hasActivePollForSession: (sessionId) => activePollBySession.has(sessionId),
+      isChatMutedForChat: () => false,
+      enqueueOrderedConversationDelivery,
+      sendNextPoll: async () => {
+        sendCount += 1;
+      },
+    });
+
+    scheduleNextQuestionPoll("session-1");
+    await Promise.resolve();
+    expect(sendCount).toBe(0);
+
+    __daemonTestUtils.clearInteractiveStateForLocalPromptSubmit({
+      clearPendingQuestions: (sessionId) => {
+        pendingQuestionsBySession.delete(sessionId);
+      },
+      clearPendingApproval: (sessionId) => {
+        pendingApprovalBySession.delete(sessionId);
+      },
+      getActivePollForSession: (sessionId) => activePollBySession.get(sessionId),
+      removePoll: (pollId) => {
+        removedPollIds.push(pollId);
+        activePollBySession.delete("session-1");
+      },
+      closePollForChat: (chatId, messageId) => {
+        closedPolls.push({ chatId, messageId });
+      },
+    }, "session-1");
+
+    expect(pendingQuestionsBySession.has("session-1")).toBe(false);
+    expect(pendingApprovalBySession.has("session-1")).toBe(false);
+    expect(removedPollIds).toEqual(["poll-1"]);
+    expect(closedPolls).toEqual([{ chatId: "telegram:1", messageId: "msg-1" }]);
+
+    scheduleNextQuestionPoll("session-1");
+    await Promise.resolve();
+    expect(sendCount).toBe(0);
+  });
+
+  it("does not send duplicate question polls while one is active and resumes after answer", async () => {
+    const pendingBySession = new Map<string, { chatId: string }>([["session-1", { chatId: "telegram:1" }]]);
+    let hasActivePoll = true;
+    let sendCount = 0;
+
+    const enqueueOrderedConversationDelivery = __daemonTestUtils.createOrderedConversationQueue({
+      getTimeoutMs: () => 800,
+      logSkip: async () => {},
+      onSkip: async () => {},
+    });
+    const scheduleNextQuestionPoll = __daemonTestUtils.createQuestionPollScheduler({
+      getPendingQuestions: (sessionId) => pendingBySession.get(sessionId) ?? null,
+      hasActivePollForSession: () => hasActivePoll,
+      isChatMutedForChat: () => false,
+      enqueueOrderedConversationDelivery,
+      sendNextPoll: async () => {
+        sendCount += 1;
+      },
+    });
+
+    scheduleNextQuestionPoll("session-1");
+    scheduleNextQuestionPoll("session-1");
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(sendCount).toBe(0);
+
+    hasActivePoll = false;
+    scheduleNextQuestionPoll("session-1");
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(sendCount).toBe(1);
+
+    hasActivePoll = true;
+    scheduleNextQuestionPoll("session-1");
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(sendCount).toBe(1);
+
+    hasActivePoll = false;
+    scheduleNextQuestionPoll("session-1");
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(sendCount).toBe(2);
+  });
+
   it("emits skip notices and continues after a failed ordered delivery", async () => {
     const notices: Array<{ chatId: string; timeoutMs: number }> = [];
     const calls: string[] = [];
@@ -474,6 +577,7 @@ describe("daemon output controls", () => {
     });
     const scheduleNextQuestionPoll = __daemonTestUtils.createQuestionPollScheduler({
       getPendingQuestions: (sessionId) => pendingBySession.get(sessionId) ?? null,
+      hasActivePollForSession: () => false,
       isChatMutedForChat: () => true,
       enqueueOrderedConversationDelivery,
       sendNextPoll: async () => {

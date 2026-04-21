@@ -61,6 +61,7 @@ export interface DaemonContext {
   getBoundChat: (sessionId: string) => string | null;
   handleConversationEvent: (sessionId: string, event: ConversationEvent) => Promise<void>;
   handleTyping: (sessionId: string, active: boolean) => void;
+  handleLocalPromptSubmit: (sessionId: string) => void;
   handleBackgroundJob: (
     sessionId: string,
     event: {
@@ -344,6 +345,7 @@ export async function startControlServer(ctx: DaemonContext): Promise<void> {
         }
 
         if (eventName === "UserPromptSubmit") {
+          ctx.handleLocalPromptSubmit(sessionId);
           ctx.handleTyping(sessionId, true);
           return Response.json({ ok: true });
         }

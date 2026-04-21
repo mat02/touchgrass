@@ -285,6 +285,7 @@ function createOrderedConversationQueue(deps: {
 
 function createQuestionPollScheduler(deps: {
   getPendingQuestions: (sessionId: string) => { chatId: ChannelChatId } | null;
+  hasActivePollForSession: (sessionId: string) => boolean;
   isChatMutedForChat: (chatId: ChannelChatId) => boolean;
   enqueueOrderedConversationDelivery: (
     chatId: ChannelChatId,
@@ -294,18 +295,35 @@ function createQuestionPollScheduler(deps: {
 }): (sessionId: string) => void {
   return (sessionId) => {
     const pending = deps.getPendingQuestions(sessionId);
-    if (!pending) return;
+    if (!pending || deps.hasActivePollForSession(sessionId)) return;
     const chatId = pending.chatId;
     deps.enqueueOrderedConversationDelivery(chatId, async (timeoutMs) => {
+      if (deps.hasActivePollForSession(sessionId)) return;
       if (deps.isChatMutedForChat(chatId)) return;
       await deps.sendNextPoll(sessionId, { timeoutMs });
     });
   };
 }
 
+function clearInteractiveStateForLocalPromptSubmit(deps: {
+  clearPendingQuestions: (sessionId: string) => void;
+  clearPendingApproval: (sessionId: string) => void;
+  getActivePollForSession: (sessionId: string) => { pollId: string; poll: { chatId: ChannelChatId; messageId: string } } | undefined;
+  removePoll: (pollId: string) => void;
+  closePollForChat: (chatId: ChannelChatId, messageId: string) => void;
+}, sessionId: string): void {
+  const active = deps.getActivePollForSession(sessionId);
+  deps.clearPendingQuestions(sessionId);
+  deps.clearPendingApproval(sessionId);
+  if (!active) return;
+  deps.removePoll(active.pollId);
+  deps.closePollForChat(active.poll.chatId, active.poll.messageId);
+}
+
 export const __daemonTestUtils = {
   createOrderedConversationQueue,
   createQuestionPollScheduler,
+  clearInteractiveStateForLocalPromptSubmit,
   formatThinkingNotification,
   formatToolResultNotification,
   buildRecentActivityReplayMessages,
@@ -1875,6 +1893,7 @@ export async function startDaemon(): Promise<void> {
   // --- Poll / AskUserQuestion support ---
 
   async function sendNextPoll(sessionId: string, sendOptions?: { timeoutMs?: number }) {
+    if (sessionManager.getActivePollForSession(sessionId)) return;
     const pending = sessionManager.getPendingQuestions(sessionId);
     if (!pending) return;
     const idx = pending.currentIndex;
@@ -1922,6 +1941,7 @@ export async function startDaemon(): Promise<void> {
   }
 
   async function sendPendingApprovalPoll(sessionId: string, sendOptions?: { timeoutMs?: number }) {
+    if (sessionManager.getActivePollForSession(sessionId)) return;
     const pending = pendingApprovalBySession.get(sessionId);
     if (!pending) return;
     try {
@@ -1954,8 +1974,10 @@ export async function startDaemon(): Promise<void> {
     }
   }
 
+
   const scheduleNextQuestionPoll = createQuestionPollScheduler({
     getPendingQuestions: (sessionId) => sessionManager.getPendingQuestions(sessionId) ?? null,
+    hasActivePollForSession: (sessionId) => !!sessionManager.getActivePollForSession(sessionId),
     isChatMutedForChat,
     enqueueOrderedConversationDelivery,
     sendNextPoll,
@@ -1971,6 +1993,16 @@ export async function startDaemon(): Promise<void> {
     if (sessionManager.getPendingQuestions(sessionId)?.chatId === chatId) {
       scheduleNextQuestionPoll(sessionId);
     }
+  };
+
+  const handleLocalPromptSubmit = (sessionId: string): void => {
+    clearInteractiveStateForLocalPromptSubmit({
+      clearPendingQuestions: (targetSessionId) => sessionManager.clearPendingQuestions(targetSessionId),
+      clearPendingApproval: (targetSessionId) => pendingApprovalBySession.delete(targetSessionId),
+      getActivePollForSession: (targetSessionId) => sessionManager.getActivePollForSession(targetSessionId),
+      removePoll: (pollId) => sessionManager.removePoll(pollId),
+      closePollForChat: (chatId, messageId) => closePollForChat(chatId, messageId),
+    }, sessionId);
   };
 
   function buildFilePickerPage(
@@ -3156,6 +3188,9 @@ export async function startDaemon(): Promise<void> {
           }
         });
       }
+    },
+    handleLocalPromptSubmit(sessionId: string): void {
+      handleLocalPromptSubmit(sessionId);
     },
     handleTyping(sessionId: string, active: boolean): void {
       const remote = sessionManager.getRemote(sessionId);
