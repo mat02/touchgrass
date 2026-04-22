@@ -262,25 +262,31 @@ function createOrderedConversationQueue(deps: {
   logSkip: (chatId: ChannelChatId, error: Error) => Promise<void>;
   onSkip: (chatId: ChannelChatId, timeoutMs: number) => Promise<void>;
 }): (chatId: ChannelChatId, deliver: (timeoutMs: number) => Promise<void>) => void {
-  const queues = new Map<ChannelChatId, Promise<void>>();
+  const queues = new Map<ChannelChatId, { tail: Promise<void>; settled: boolean }>();
   return (chatId, deliver) => {
-    const previous = queues.get(chatId) ?? Promise.resolve();
-    const current = previous
-      .catch(() => {})
-      .then(async () => {
-        const timeoutMs = deps.getTimeoutMs();
-        try {
-          await deliver(timeoutMs);
-        } catch (error) {
-          const err = error instanceof Error ? error : new Error(String(error));
-          await deps.logSkip(chatId, err);
-          await deps.onSkip(chatId, timeoutMs);
-        }
-      })
-      .finally(() => {
-        if (queues.get(chatId) === current) queues.delete(chatId);
-      });
-    queues.set(chatId, current);
+    const previousEntry = queues.get(chatId);
+    const run = async () => {
+      const timeoutMs = deps.getTimeoutMs();
+      try {
+        await deliver(timeoutMs);
+      } catch (error) {
+        const err = error instanceof Error ? error : new Error(String(error));
+        await deps.logSkip(chatId, err);
+        await deps.onSkip(chatId, timeoutMs);
+      }
+    };
+    const current = (async () => {
+      if (previousEntry && !previousEntry.settled) {
+        await previousEntry.tail.catch(() => {});
+      }
+      await run();
+    })();
+    const entry = { tail: current, settled: false };
+    queues.set(chatId, entry);
+    void current.finally(() => {
+      entry.settled = true;
+      if (queues.get(chatId) === entry) queues.delete(chatId);
+    });
   };
 }
 
