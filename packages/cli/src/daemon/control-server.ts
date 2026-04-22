@@ -80,6 +80,7 @@ export interface DaemonContext {
   handleConversationEvent: (sessionId: string, event: ConversationEvent) => Promise<void>;
   handleTyping: (sessionId: string, active: boolean) => void;
   handleLocalPromptSubmit: (sessionId: string) => void;
+  handleOmpNewHandoff: (sessionId: string) => Promise<void>;
   handleBackgroundJob: (
     sessionId: string,
     event: {
@@ -456,7 +457,7 @@ export async function startControlServer(ctx: DaemonContext): Promise<void> {
       }
 
       // Match /remote/:id/* actions
-      const remoteMatch = path.match(/^\/remote\/(r-[a-f0-9]+)\/(input|exit|subscribed-groups|conversation-event|typing|background-job|wait-state|send-input|send-message)$/);
+      const remoteMatch = path.match(/^\/remote\/(r-[a-f0-9]+)\/(input|exit|subscribed-groups|conversation-event|typing|background-job|wait-state|send-input|send-message|omp-new-handoff)$/);
       if (remoteMatch) {
         const [, sessionId, action] = remoteMatch;
         if (action === "conversation-event" && req.method === "POST") {
@@ -522,6 +523,10 @@ export async function startControlServer(ctx: DaemonContext): Promise<void> {
           const body = await readJsonBody(req);
           const active = body.active === true;
           ctx.handleTyping(sessionId, active);
+          return Response.json({ ok: true });
+        }
+        if (action === "omp-new-handoff" && req.method === "POST") {
+          await ctx.handleOmpNewHandoff(sessionId);
           return Response.json({ ok: true });
         }
         if (action === "input" && req.method === "GET") {

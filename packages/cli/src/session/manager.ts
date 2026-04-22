@@ -279,6 +279,13 @@ export class SessionManager {
     return true;
   }
 
+  requestRemoteOmpNew(id: string): boolean {
+    const remote = this.remotes.get(id);
+    if (!remote) return false;
+    remote.controlAction = mergeRemoteControlAction(remote.controlAction, { type: "omp-new" });
+    return true;
+  }
+
   killAll(): void {
     this.remotes.clear();
     this.attachments.clear();

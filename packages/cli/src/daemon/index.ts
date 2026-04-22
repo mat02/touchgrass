@@ -58,7 +58,7 @@ import type { Formatter } from "../channel/formatter";
 import type { Channel, ChannelChatId, ChannelUserId, StatusBoardFailureCode, StatusBoardResult } from "../channel/types";
 import { getChannelName, getChannelType, getRootChatIdNumber, parseChannelAddress } from "../channel/id";
 import type { AskQuestion, PendingFilePickerOption, PendingOutputModeOption } from "../session/manager";
-import { readManifests } from "../bot/handlers/remote-control";
+import { presentRemoteControlPicker, readManifests } from "../bot/handlers/remote-control";
 import { collectRecentActivityPreviewFromRaw, type DisplayEntry } from "../cli/peek";
 import { chmod, open, readFile, realpath, stat, writeFile } from "fs/promises";
 import { basename, dirname, join, resolve } from "path";
@@ -327,7 +327,42 @@ function clearInteractiveStateForLocalPromptSubmit(deps: {
   deps.closePollForChat(active.poll.chatId, active.poll.messageId);
 }
 
+async function handleConfirmedOmpNewHandoff(
+  deps: {
+    sessionManager: Pick<SessionManager, "detach" | "getAttachedRemote" | "getBoundChat" | "getRemote" | "listRemotesForUser" | "registerRemoteControlPicker">;
+    getChannelForChat: (chatId: ChannelChatId) => Channel | undefined;
+    getFormatterForChat: (chatId: ChannelChatId) => Formatter;
+    syncCommandMenuForChat: (chatId: ChannelChatId, userId: ChannelUserId) => void;
+  },
+  sessionId: string
+): Promise<void> {
+  const remote = deps.sessionManager.getRemote(sessionId);
+  if (!remote) return;
+
+  const boundChat = deps.sessionManager.getBoundChat(sessionId);
+  if (!boundChat) return;
+
+  deps.sessionManager.detach(boundChat);
+  deps.syncCommandMenuForChat(boundChat, remote.ownerUserId);
+
+  const channel = deps.getChannelForChat(boundChat);
+  if (!channel) return;
+
+  channel.setTyping(boundChat, false);
+  const fmt = deps.getFormatterForChat(boundChat);
+  await channel.send(
+    boundChat,
+    `${fmt.escape("⛳️")} ${fmt.code("/new")} started a new OMP session. Select the touchgrass session to attach.`
+  );
+  await presentRemoteControlPicker(boundChat, remote.ownerUserId, {
+    channel,
+    sessionManager: deps.sessionManager,
+  });
+}
+
+
 export const __daemonTestUtils = {
+  handleConfirmedOmpNewHandoff,
   createOrderedConversationQueue,
   createQuestionPollScheduler,
   clearInteractiveStateForLocalPromptSubmit,
@@ -4402,6 +4437,14 @@ export async function startDaemon(): Promise<void> {
         }
         setTypingForChat(cid, active);
       }
+    },
+    async handleOmpNewHandoff(sessionId: string): Promise<void> {
+      await handleConfirmedOmpNewHandoff({
+        sessionManager,
+        getChannelForChat,
+        getFormatterForChat,
+        syncCommandMenuForChat,
+      }, sessionId);
     },
     handleBackgroundJob(
       sessionId: string,

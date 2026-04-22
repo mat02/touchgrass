@@ -1,8 +1,8 @@
 import { readdirSync, readFileSync, statSync } from "fs";
 import { join } from "path";
-import type { InboundMessage } from "../../channel/types";
+import type { ChannelChatId, ChannelUserId, InboundMessage } from "../../channel/types";
 import type { RouterContext } from "../command-router";
-import type { RemoteSession, RemoteControlPickerOption } from "../../session/manager";
+import type { RemoteSession, RemoteControlPickerOption, SessionManager } from "../../session/manager";
 import { readAgentSoul } from "../../daemon/agent-soul";
 import { paths } from "../../config/paths";
 
@@ -80,52 +80,50 @@ async function buildSessionLabel(remote: RemoteSession, lastActivityMs: number):
 
   return `${timePrefix}${header}`;
 }
+interface RemoteControlPickerDeps {
+  channel: Pick<RouterContext["channel"], "fmt" | "send" | "sendPoll">;
+  sessionManager: Pick<SessionManager, "getAttachedRemote" | "listRemotesForUser" | "registerRemoteControlPicker">;
+}
 
-export async function handleStartRemoteControl(
-  msg: InboundMessage,
-  ctx: RouterContext
+export async function presentRemoteControlPicker(
+  chatId: ChannelChatId,
+  ownerUserId: ChannelUserId,
+  deps: RemoteControlPickerDeps
 ): Promise<void> {
-  const chatId = msg.chatId;
-  const userId = msg.userId;
-  const { fmt } = ctx.channel;
+  const { channel, sessionManager } = deps;
+  const { fmt } = channel;
 
-  const userSessions = ctx.sessionManager.listRemotesForUser(userId);
+  const userSessions = sessionManager.listRemotesForUser(ownerUserId);
   if (userSessions.length === 0) {
-    await ctx.channel.send(
+    await channel.send(
       chatId,
       `No active sessions. Start one with ${fmt.code("touchgrass claude")}, ${fmt.code("touchgrass codex")}, ${fmt.code("touchgrass pi")}, ${fmt.code("touchgrass omp")}, ${fmt.code("touchgrass kimi")}, or ${fmt.code("touchgrass gemini")}.`
     );
     return;
   }
 
-  if (!ctx.channel.sendPoll) {
-    await ctx.channel.send(chatId, "This channel does not support picker buttons.");
+  if (!channel.sendPoll) {
+    await channel.send(chatId, "This channel does not support picker buttons.");
     return;
   }
 
-  // Get JSONL mtime for each session (last terminal output time)
   const activityMap = new Map<string, number>();
   for (const remote of userSessions) {
     const mtime = getJsonlMtime(remote.id);
     activityMap.set(remote.id, mtime ?? remote.lastSeenAt);
   }
 
-  // Sort by most recent terminal activity first
   userSessions.sort((a, b) => (activityMap.get(b.id) ?? 0) - (activityMap.get(a.id) ?? 0));
 
-  // Build options
   const options: RemoteControlPickerOption[] = [];
   const optionLabels: string[] = [];
+  const attached = sessionManager.getAttachedRemote(chatId);
 
-  const attached = ctx.sessionManager.getAttachedRemote(chatId);
-
-  // List all user sessions
   for (const remote of userSessions.slice(0, RC_BUTTON_LIMIT)) {
     const lastActivity = activityMap.get(remote.id) ?? Date.now();
     const label = await buildSessionLabel(remote, lastActivity);
     const isAttached = attached?.id === remote.id;
     const displayLabel = isAttached ? `${label} (connected)` : label;
-    // Ensure we don't exceed Telegram's 100-char poll option limit
     const finalLabel = displayLabel.length > MAX_OPTION_CHARS
       ? displayLabel.slice(0, MAX_OPTION_CHARS - 1) + "…"
       : displayLabel;
@@ -134,15 +132,21 @@ export async function handleStartRemoteControl(
   }
 
   const title = `⛳️ Select session — ${userSessions.length} active`;
-
-  const sent = await ctx.channel.sendPoll(chatId, title, optionLabels, false);
-  ctx.sessionManager.registerRemoteControlPicker({
+  const sent = await channel.sendPoll(chatId, title, optionLabels, false);
+  sessionManager.registerRemoteControlPicker({
     pollId: sent.pollId,
     messageId: sent.messageId,
     chatId,
-    ownerUserId: userId,
+    ownerUserId,
     options,
   });
+}
+
+export async function handleStartRemoteControl(
+  msg: InboundMessage,
+  ctx: RouterContext
+): Promise<void> {
+  await presentRemoteControlPicker(msg.chatId, msg.userId, ctx);
 }
 
 export async function handleStopRemoteControl(

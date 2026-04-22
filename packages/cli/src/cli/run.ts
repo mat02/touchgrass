@@ -35,6 +35,8 @@ const APPROVAL_PATTERNS: Record<string, { promptText: string; optionText: string
   // kimi: { promptText: "...", optionText: "..." },
 };
 
+const OMP_NEW_HANDOFF_WINDOW_MS = 15_000;
+
 // Test-only accessors for CLI arg parsing behavior.
 interface OmpSessionWatchDecision {
   nextSessionFile: string | null;
@@ -50,7 +52,6 @@ export const __cliRunTestUtils = {
   parseJsonlMessage,
   isVersionBelow,
   extractApprovalPrompt,
-  selectOmpRolloverSessionFile,
   planOmpSessionWatchDecision,
   watchGeminiSessionFile,
   resetParserState: () => {
@@ -463,33 +464,31 @@ function readSessionIdsFromJsonl(filePath: string, maxLines = 80): Set<string> {
   return ids;
 }
 
-function selectOmpRolloverSessionFile(
-  activeSessionFile: string | null,
-  sessionFiles: string[]
-): string | null {
-  if (!activeSessionFile) return null;
-  const newestSessionFile = sessionFiles[0];
-  if (!newestSessionFile) return null;
-  return newestSessionFile !== activeSessionFile ? newestSessionFile : null;
-}
-
 function planOmpSessionWatchDecision(
-  activeSessionFile: string | null,
   hasWatcher: boolean,
   sessionFiles: string[],
-  existingFiles: ReadonlySet<string>
+  existingFiles: ReadonlySet<string>,
+  pendingOmpNewFiles: ReadonlySet<string> | null = null
 ): OmpSessionWatchDecision {
   if (!hasWatcher) {
+    const unseenSessionFiles = sessionFiles.filter((filePath) => !existingFiles.has(filePath));
     return {
-      nextSessionFile: sessionFiles.find((filePath) => !existingFiles.has(filePath)) || null,
+      nextSessionFile: unseenSessionFiles[0] || null,
       replaceCurrent: false,
     };
   }
 
-  const rolloverSessionFile = selectOmpRolloverSessionFile(activeSessionFile, sessionFiles);
+  if (pendingOmpNewFiles) {
+    const rolloverSessionFiles = sessionFiles.filter((filePath) => !pendingOmpNewFiles.has(filePath));
+    return {
+      nextSessionFile: rolloverSessionFiles[0] || null,
+      replaceCurrent: rolloverSessionFiles.length > 0,
+    };
+  }
+
   return {
-    nextSessionFile: rolloverSessionFile,
-    replaceCurrent: rolloverSessionFile !== null,
+    nextSessionFile: null,
+    replaceCurrent: false,
   };
 }
 
@@ -3143,6 +3142,8 @@ export async function runRun(): Promise<void> {
       const tgRemoteId = remoteId;
       let activeSessionFile: string | null = null;
       let activeClaudeSessionId: string | null = null;
+      let pendingOmpNewFiles: ReadonlySet<string> | null = null;
+      let pendingOmpNewUntil = 0;
 
       const startFileWatch = (sessionFile: string, skipExisting = false, replaceCurrent = false) => {
         if (activeSessionFile === sessionFile) return;
@@ -3282,11 +3283,18 @@ export async function runRun(): Promise<void> {
         if (cmdName === "omp") {
           try {
             const sessionFiles = listOmpSessionFiles(process.cwd());
+            const activePendingOmpNewFiles = pendingOmpNewFiles && pendingOmpNewUntil > Date.now()
+              ? pendingOmpNewFiles
+              : null;
+            if (!activePendingOmpNewFiles) {
+              pendingOmpNewFiles = null;
+              pendingOmpNewUntil = 0;
+            }
             const watchDecision = planOmpSessionWatchDecision(
-              activeSessionFile,
               !!watcherRef.current,
               sessionFiles,
-              existingFiles
+              existingFiles,
+              activePendingOmpNewFiles
             );
             for (const filePath of sessionFiles) {
               existingFiles.add(filePath);
@@ -3297,6 +3305,13 @@ export async function runRun(): Promise<void> {
                 false,
                 watchDecision.replaceCurrent
               );
+              if (watchDecision.replaceCurrent) {
+                pendingOmpNewFiles = null;
+                pendingOmpNewUntil = 0;
+                if (tgRemoteId) {
+                  daemonRequest(`/remote/${tgRemoteId}/omp-new-handoff`, "POST").catch(() => {});
+                }
+              }
             }
           } catch {}
           return;
@@ -3388,6 +3403,22 @@ export async function runRun(): Promise<void> {
       return remoteId ? readSessionManifestSync(remoteId)?.name ?? manifest?.name : manifest?.name;
     };
     if (remoteId && chatId && ownerUserId && recovery) {
+      const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+      const writeTerminalInputLine = async (line: string, showTyping = true): Promise<void> => {
+        if (showTyping && channel && chatId) {
+          const typingTarget = getPrimaryTargetChat();
+          if (typingTarget) channel.setTyping(typingTarget, true);
+          for (const gid of subscribedGroups) channel.setTyping(gid, true);
+        }
+
+        terminal.write(encodeBracketedPaste(line));
+        const hasFilePath = line.includes("/.touchgrass/uploads/");
+        await delay(hasFilePath ? 1500 : 150);
+        terminal.write(Buffer.from("\r"));
+        await delay(80);
+        terminal.write(Buffer.from("\r"));
+        await delay(100);
+      };
 
       pollTimer = setInterval(async () => {
         if (processingInput || recovery.isRecovering()) return;
@@ -3441,11 +3472,20 @@ export async function runRun(): Promise<void> {
             } catch {}
             return;
           }
+          if (remoteControl && typeof remoteControl === "object" && remoteControl.type === "omp-new") {
+            pendingOmpNewFiles = new Set(listOmpSessionFiles(process.cwd()));
+            pendingOmpNewUntil = Date.now() + OMP_NEW_HANDOFF_WINDOW_MS;
+            processingInput = true;
+            try {
+              await writeTerminalInputLine("/new", false);
+            } finally {
+              processingInput = false;
+            }
+          }
 
           const lines = res.lines as string[] | undefined;
           if (lines && lines.length > 0) {
             processingInput = true;
-            const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
             for (const line of lines) {
               // Poll next/submit: navigate Down to "Next"/"Submit" button, then Enter
@@ -3489,25 +3529,7 @@ export async function runRun(): Promise<void> {
                 continue;
               }
 
-              // Regular text input — start typing indicator
-              if (channel && chatId) {
-                const typingTarget = getPrimaryTargetChat();
-                if (typingTarget) channel.setTyping(typingTarget, true);
-                for (const gid of subscribedGroups) channel.setTyping(gid, true);
-              }
-              // Send remote text as bracketed paste so special chars (like '@')
-              // stay literal and don't trigger interactive pickers/autocomplete.
-              terminal.write(encodeBracketedPaste(line));
-              // File paths need extra time for the tool to load/process the attachment
-              const hasFilePath = line.includes("/.touchgrass/uploads/");
-              await delay(hasFilePath ? 1500 : 150);
-              // Some CLI tools use multiline editors where Enter after a paste
-              // adds a newline instead of submitting. A second Enter on the
-              // resulting empty line triggers submit.
-              terminal.write(Buffer.from("\r"));
-              await delay(80);
-              terminal.write(Buffer.from("\r"));
-              await delay(100);
+              await writeTerminalInputLine(line);
             }
             processingInput = false;
           }
@@ -3585,6 +3607,9 @@ export async function runRun(): Promise<void> {
           if (remoteControl && typeof remoteControl === "object" && remoteControl.type === "resume") {
             requestedResumeSessionRef = remoteControl.sessionRef;
             break;
+          }
+          if (remoteControl && typeof remoteControl === "object" && remoteControl.type === "omp-new") {
+            continue;
           }
           if (remoteControl === "stop" || remoteControl === "kill") {
             break;

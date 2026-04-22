@@ -16,7 +16,7 @@ describe("OMP session cutover watch planning", () => {
     const existingFiles = new Set([oldSessionFile]);
 
     expect(
-      planOmpSessionWatchDecision(null, false, [oldSessionFile], existingFiles)
+      planOmpSessionWatchDecision(false, [oldSessionFile], existingFiles)
     ).toEqual({
       nextSessionFile: null,
       replaceCurrent: false,
@@ -24,31 +24,51 @@ describe("OMP session cutover watch planning", () => {
 
     const newSessionFile = "/tmp/omp/new.jsonl";
     expect(
-      planOmpSessionWatchDecision(
-        null,
-        false,
-        [newSessionFile, oldSessionFile],
-        existingFiles
-      )
+      planOmpSessionWatchDecision(false, [newSessionFile, oldSessionFile], existingFiles)
     ).toEqual({
       nextSessionFile: newSessionFile,
       replaceCurrent: false,
     });
+
+    const newerSessionFile = "/tmp/omp/newer.jsonl";
+    expect(
+      planOmpSessionWatchDecision(
+        false,
+        [newerSessionFile, newSessionFile, oldSessionFile],
+        existingFiles
+      )
+    ).toEqual({
+      nextSessionFile: newerSessionFile,
+      replaceCurrent: false,
+    });
   });
 
-  it("switches to the newest OMP log while leaving chat binding intact", () => {
+  it("allows exactly one OMP handoff after an explicit /new request", () => {
     const oldSessionFile = "/tmp/omp/old.jsonl";
     const newSessionFile = "/tmp/omp/new.jsonl";
-    const decision = planOmpSessionWatchDecision(
-      oldSessionFile,
+    const existingFiles = new Set([oldSessionFile, newSessionFile]);
+
+    const handoffDecision = planOmpSessionWatchDecision(
       true,
       [newSessionFile, oldSessionFile],
-      new Set([oldSessionFile, newSessionFile])
+      existingFiles,
+      new Set([oldSessionFile])
     );
 
-    expect(decision).toEqual({
+    expect(handoffDecision).toEqual({
       nextSessionFile: newSessionFile,
       replaceCurrent: true,
+    });
+
+    const pinnedDecision = planOmpSessionWatchDecision(
+      true,
+      [newSessionFile, oldSessionFile],
+      existingFiles
+    );
+
+    expect(pinnedDecision).toEqual({
+      nextSessionFile: null,
+      replaceCurrent: false,
     });
 
     const manager = createManager();
@@ -60,8 +80,8 @@ describe("OMP session cutover watch planning", () => {
     expect(manager.getBoundChat(remote.id)).toBe(boundChat);
 
     let activeSessionFile = oldSessionFile;
-    if (decision.nextSessionFile) {
-      activeSessionFile = decision.nextSessionFile;
+    if (handoffDecision.nextSessionFile) {
+      activeSessionFile = handoffDecision.nextSessionFile;
     }
 
     expect(activeSessionFile).toBe(newSessionFile);

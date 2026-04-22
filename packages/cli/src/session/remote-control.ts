@@ -3,7 +3,11 @@ export interface RemoteResumeControlAction {
   sessionRef: string;
 }
 
-export type RemoteControlAction = "stop" | "kill" | RemoteResumeControlAction;
+export interface RemoteOmpNewControlAction {
+  type: "omp-new";
+}
+
+export type RemoteControlAction = "stop" | "kill" | RemoteResumeControlAction | RemoteOmpNewControlAction;
 
 const UNSAFE_SESSION_REF = /[;&|`$(){}!#<>\\'"]/;
 
@@ -13,9 +17,16 @@ function isResumeControlAction(value: unknown): value is RemoteResumeControlActi
   return raw.type === "resume" && typeof raw.sessionRef === "string" && raw.sessionRef.length > 0 && !UNSAFE_SESSION_REF.test(raw.sessionRef);
 }
 
+function isOmpNewControlAction(value: unknown): value is RemoteOmpNewControlAction {
+  if (!value || typeof value !== "object") return false;
+  const raw = value as Record<string, unknown>;
+  return raw.type === "omp-new";
+}
+
 export function parseRemoteControlAction(value: unknown): RemoteControlAction | null {
   if (value === "stop" || value === "kill") return value;
   if (isResumeControlAction(value)) return { type: "resume", sessionRef: value.sessionRef };
+  if (isOmpNewControlAction(value)) return { type: "omp-new" };
   return null;
 }
 

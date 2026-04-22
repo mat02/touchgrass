@@ -22,6 +22,7 @@ import { handleOutputModeCommand } from "./handlers/output-mode";
 import type { BackgroundJobSessionSummary } from "./handlers/background-jobs";
 import { handleSkillsCommand } from "./handlers/skills";
 import { handleMuteCommand, handleThrottleCommand, handleUnmuteCommand } from "./handlers/mute";
+import { handleNewSessionCommand } from "./handlers/new-session";
 import { handleStartRemoteControl, handleStopRemoteControl } from "./handlers/remote-control";
 import { logger } from "../daemon/logger";
 import { notifyApp } from "../daemon/notify-app";
@@ -91,9 +92,10 @@ export async function routeMessage(
     else if (rest === " unlink") text = "/unlink";
     else if (rest === " rc") text = "/start_remote_control";
     else if (rest === " rc stop") text = "/stop_remote_control";
+    else if (rest === " new") text = "/new";
     else if (rest === " pair" || rest.startsWith(" pair ")) text = `/pair${rest.slice(" pair".length)}`;
-  }
 
+  }
   const userId = msg.userId;
   const chatId = msg.chatId;
   const channelName = ctx.channelName;
@@ -210,7 +212,12 @@ export async function routeMessage(
     return;
   }
 
-  if (text === "/stop" || text === "/kill" || text === "/new" || text === "/start" || text.startsWith("/start ") || text.startsWith("/new ")) {
+  if (text === "/new") {
+    await handleNewSessionCommand({ ...msg, text }, ctx);
+    return;
+  }
+
+  if (text === "/stop" || text === "/kill" || text === "/start" || text.startsWith("/start ") || text.startsWith("/new ")) {
     await ctx.channel.send(
       chatId,
       `${fmt.escape("⛳️ Chat-side session start/stop was removed. Start sessions from your terminal with")} ${fmt.code("touchgrass claude")}, ${fmt.code("touchgrass codex")}, ${fmt.code("touchgrass pi")}, ${fmt.code("touchgrass omp")}, ${fmt.code("touchgrass kimi")}, ${fmt.code("touchgrass gemini")} ${fmt.escape("and use")} ${fmt.code("touchgrass stop <id>")} ${fmt.escape("or")} ${fmt.code("touchgrass kill <id>")} ${fmt.escape("from terminal when needed.")}`
