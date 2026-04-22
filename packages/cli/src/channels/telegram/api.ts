@@ -99,6 +99,44 @@ interface ApiResponse<T> {
   parameters?: { retry_after?: number };
 }
 
+export type TelegramApiErrorKind = "timeout" | "http" | "api";
+
+export class TelegramApiError extends Error {
+  readonly kind: TelegramApiErrorKind;
+  readonly method: string;
+  readonly status?: number;
+  readonly description?: string;
+  readonly timeoutMs?: number;
+
+  constructor(
+    kind: TelegramApiErrorKind,
+    method: string,
+    message: string,
+    options?: { status?: number; description?: string; timeoutMs?: number }
+  ) {
+    super(message);
+    this.name = "TelegramApiError";
+    this.kind = kind;
+    this.method = method;
+    this.status = options?.status;
+    this.description = options?.description;
+    this.timeoutMs = options?.timeoutMs;
+  }
+}
+
+export function isTelegramApiError(error: unknown): error is TelegramApiError {
+  return error instanceof TelegramApiError;
+}
+
+export function isTelegramTextTooLongError(error: unknown): boolean {
+  if (error instanceof TelegramApiError) {
+    const description = `${error.description || ""} ${error.message}`.toLowerCase();
+    return description.includes("message is too long") || description.includes("text is too long");
+  }
+  const text = (error as Error | undefined)?.message?.toLowerCase?.() || "";
+  return text.includes("message is too long") || text.includes("text is too long");
+}
+
 export class TelegramApi {
   private baseUrl: string;
   private static readonly DEFAULT_TIMEOUT_MS = 15000;
@@ -125,7 +163,7 @@ export class TelegramApi {
       });
     } catch (error) {
       if (error instanceof DOMException && error.name === "AbortError") {
-        throw new Error(`Telegram API ${method} timed out after ${timeoutMs}ms`);
+        throw new TelegramApiError("timeout", method, `Telegram API ${method} timed out after ${timeoutMs}ms`, { timeoutMs });
       }
       throw error;
     } finally {
@@ -141,12 +179,12 @@ export class TelegramApi {
 
     if (!res.ok) {
       const body = await res.text();
-      throw new Error(`Telegram API ${method} failed (${res.status}): ${body}`);
+      throw new TelegramApiError("http", method, `Telegram API ${method} failed (${res.status}): ${body}`, { status: res.status, description: body });
     }
 
     const body = (await res.json()) as ApiResponse<T>;
     if (!body.ok) {
-      throw new Error(`Telegram API ${method}: ${body.description}`);
+      throw new TelegramApiError("api", method, `Telegram API ${method}: ${body.description}`, { description: body.description });
     }
     return body.result;
   }
@@ -263,7 +301,7 @@ export class TelegramApi {
       res = await fetch(url, { method: "POST", body: formData, signal: controller.signal });
     } catch (error) {
       if (error instanceof DOMException && error.name === "AbortError") {
-        throw new Error(`Telegram API sendDocument timed out after ${timeoutMs}ms`);
+        throw new TelegramApiError("timeout", "sendDocument", `Telegram API sendDocument timed out after ${timeoutMs}ms`, { timeoutMs });
       }
       throw error;
     } finally {
@@ -279,11 +317,13 @@ export class TelegramApi {
 
     if (!res.ok) {
       const body = await res.text();
-      throw new Error(`Telegram API sendDocument failed (${res.status}): ${body}`);
+      throw new TelegramApiError("http", "sendDocument", `Telegram API sendDocument failed (${res.status}): ${body}`, { status: res.status, description: body });
     }
 
     const body = (await res.json()) as ApiResponse<TelegramMessage>;
-    if (!body.ok) throw new Error(`Telegram API sendDocument: ${body.description}`);
+    if (!body.ok) {
+      throw new TelegramApiError("api", "sendDocument", `Telegram API sendDocument: ${body.description}`, { description: body.description });
+    }
     return body.result;
   }
 

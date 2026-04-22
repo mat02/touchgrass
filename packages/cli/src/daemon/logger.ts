@@ -11,6 +11,7 @@ interface LogEntry {
 }
 
 let initialized = false;
+const debugLoggingEnabled = process.env.TG_DEBUG === "1";
 
 async function ensureInit() {
   if (!initialized) {
@@ -30,6 +31,15 @@ export async function log(level: LogLevel, msg: string, data?: unknown): Promise
   const line = JSON.stringify(entry) + "\n";
   await appendFile(paths.logFile, line, { encoding: "utf-8", mode: 0o600 });
   await chmod(paths.logFile, 0o600).catch(() => {});
+}
+
+export function isDebugLoggingEnabled(): boolean {
+  return debugLoggingEnabled;
+}
+
+export async function debugLogIfEnabled(msg: string, data?: unknown): Promise<void> {
+  if (!debugLoggingEnabled) return;
+  await log("debug", msg, data);
 }
 
 export const logger = {

@@ -101,7 +101,7 @@ export const defaultSettings: TgSettings = {
   outputBatchMinMs: 300,
   outputBatchMaxMs: 800,
   outputBufferMaxChars: 4096,
-  orderedConversationTimeoutMs: 2000,
+  orderedConversationTimeoutMs: 15000,
   maxSessions: 10,
   defaultShell: process.env.SHELL || "/bin/bash",
 };

@@ -35,11 +35,17 @@ export interface ClearStatusBoardOptions {
   pinned?: boolean;
 }
 
+export type StatusBoardFailureCode = "timeout" | "text_too_long" | "telegram_error";
+
 export interface StatusBoardResult {
   messageId?: string;
   pinned?: boolean;
   pinError?: string;
+  action?: "sent" | "edited" | "unchanged" | "cleared" | "failed";
+  failureCode?: StatusBoardFailureCode;
+  error?: string;
 }
+
 
 export interface CommandMenuContext {
   userId: ChannelUserId;

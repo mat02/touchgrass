@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import { __daemonTestUtils } from "../daemon/index";
+import type { StatusBoardResult } from "../channel/types";
 import { DEFAULT_CHAT_OUTPUT_PREFERENCES } from "../config/schema";
 
 const fmt = {
@@ -599,7 +600,7 @@ describe("daemon output controls", () => {
       html: string;
       options: { pin?: boolean; messageId?: string; pinned?: boolean };
       count: number;
-    }) => { messageId?: string; pinned?: boolean } | void>;
+    }) => StatusBoardResult | void>;
     clearThrowsByChat?: Set<string>;
   }) {
     const chats = options?.chats ?? ["telegram:1"];
@@ -990,6 +991,123 @@ describe("daemon output controls", () => {
       { chatId: "telegram:1", active: true },
     ]);
   });
+
+  it("bounds active wait board rendering and summarizes overflow", () => {
+    const cycle = __daemonTestUtils.createWaitCycleState("session-1", 1, 100);
+    __daemonTestUtils.applyWaitStateEventToCycleState(cycle, {
+      cycleSource: "omp-task",
+      waitGroupKey: "omp-task:overflow",
+      phase: "startOrUpdate",
+      items: Array.from({ length: 40 }, (_, index) => ({
+        itemKey: `task-${index + 1}`,
+        title: `Task ${index + 1}` ,
+        status: index === 0 ? "running" : "queued",
+        detail: `detail ${index + 1} `.repeat(24),
+      })),
+    }, 100);
+
+    const html = __daemonTestUtils.renderActiveWaitBoardState("telegram:1", cycle, fmt);
+
+    expect(html).toContain("Waiting on 40 tasks");
+    expect(html).toContain("… +");
+    expect(html.length).toBeLessThanOrEqual(3500);
+  });
+
+  it("does not retry the same oversized wait board content until it changes", async () => {
+    const harness = createWaitBoardHarness({
+      upsertBehaviorByChat: {
+        "telegram:1": () => ({ action: "failed", failureCode: "text_too_long", error: "too long" }),
+      },
+    });
+    const cycle = __daemonTestUtils.createWaitCycleState("session-1", 1, 100);
+    __daemonTestUtils.applyWaitStateEventToCycleState(cycle, {
+      cycleSource: "omp-task",
+      waitGroupKey: "omp-task:1",
+      phase: "startOrUpdate",
+      items: [{ itemKey: "task-1", title: "Draft", status: "running", detail: "First detail" }],
+    }, 100);
+
+    await __daemonTestUtils.refreshWaitCycleBoardsState("session-1", cycle, harness.ops);
+    await __daemonTestUtils.refreshWaitCycleBoardsState("session-1", cycle, harness.ops);
+
+    expect(harness.upserts).toHaveLength(1);
+
+    __daemonTestUtils.applyWaitStateEventToCycleState(cycle, {
+      cycleSource: "omp-task",
+      waitGroupKey: "omp-task:1",
+      phase: "startOrUpdate",
+      items: [{ itemKey: "task-1", detail: "Changed detail" }],
+    }, 200);
+
+    await __daemonTestUtils.refreshWaitCycleBoardsState("session-1", cycle, harness.ops);
+    expect(harness.upserts).toHaveLength(2);
+  });
+
+  it("does not retry the same timed-out wait board content until it changes", async () => {
+    const harness = createWaitBoardHarness({
+      upsertBehaviorByChat: {
+        "telegram:1": () => ({ action: "failed", failureCode: "timeout", error: "timed out" }),
+      },
+    });
+    const cycle = __daemonTestUtils.createWaitCycleState("session-1", 1, 100);
+    __daemonTestUtils.applyWaitStateEventToCycleState(cycle, {
+      cycleSource: "omp-task",
+      waitGroupKey: "omp-task:1",
+      phase: "startOrUpdate",
+      items: [{ itemKey: "task-1", title: "Draft", status: "running", detail: "Still waiting" }],
+    }, 100);
+
+    await __daemonTestUtils.refreshWaitCycleBoardsState("session-1", cycle, harness.ops);
+    await __daemonTestUtils.refreshWaitCycleBoardsState("session-1", cycle, harness.ops);
+
+    expect(harness.upserts).toHaveLength(1);
+
+    __daemonTestUtils.applyWaitStateEventToCycleState(cycle, {
+      cycleSource: "omp-task",
+      waitGroupKey: "omp-task:1",
+      phase: "startOrUpdate",
+      items: [{ itemKey: "task-1", detail: "Still waiting on review" }],
+    }, 200);
+
+    await __daemonTestUtils.refreshWaitCycleBoardsState("session-1", cycle, harness.ops);
+    expect(harness.upserts).toHaveLength(2);
+  });
+
+  it("finalizes stop-requested waits immediately and falls back to a compact final summary", async () => {
+    const harness = createWaitBoardHarness({
+      upsertBehaviorByChat: {
+        "telegram:1": ({ html, count }) => {
+          if (count === 1 && html.includes("Stop requested") && !html.includes("tracked tasks")) {
+            return { action: "failed", failureCode: "text_too_long", error: "too long" };
+          }
+          return { messageId: `telegram:1-msg-${count}`, pinned: false };
+        },
+      },
+    });
+    const cycle = __daemonTestUtils.createWaitCycleState("session-1", 1, 100);
+    __daemonTestUtils.applyWaitStateEventToCycleState(cycle, {
+      cycleSource: "omp-task",
+      waitGroupKey: "omp-task:1",
+      phase: "startOrUpdate",
+      items: [
+        { itemKey: "task-1", title: "Draft", status: "running" },
+        { itemKey: "task-2", title: "Review", status: "queued" },
+      ],
+    }, 100);
+    __daemonTestUtils.markWaitCycleStopRequestedState(cycle, 200);
+
+    await __daemonTestUtils.finalizeWaitCycleBoardsState("session-1", cycle, harness.ops);
+
+    expect(harness.upserts).toHaveLength(2);
+    expect(harness.upserts[0]?.html).toContain("Stop requested");
+    expect(harness.upserts[1]?.html).toContain("tracked tasks");
+    expect(harness.clears).toEqual([{
+      chatId: "telegram:1",
+      boardKey: cycle.boardKey,
+      options: { unpin: true, messageId: "telegram:1-msg-2", pinned: false },
+    }]);
+  });
+
 
   it("finalizes boards into retained history, starts later cycles on new boards, and cleans up restart leftovers deterministically", async () => {
     const harness = createWaitBoardHarness({ chats: ["telegram:1", "telegram:2"], clearThrowsByChat: new Set(["telegram:2"]) });

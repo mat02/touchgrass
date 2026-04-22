@@ -19,7 +19,7 @@ import {
   type TimedMuteDeliveryPreference,
 } from "../config/schema";
 import { TelegramApi } from "../channels/telegram/api";
-import { logger } from "./logger";
+import { debugLogIfEnabled, logger } from "./logger";
 import {
   acquireDaemonLock,
   installSignalHandlers,
@@ -55,13 +55,14 @@ import { rotateDaemonAuthToken } from "../security/daemon-auth";
 import { createChannel } from "../channel/factory";
 import { InternalChannel } from "../channels/internal/channel";
 import type { Formatter } from "../channel/formatter";
-import type { Channel, ChannelChatId, ChannelUserId } from "../channel/types";
+import type { Channel, ChannelChatId, ChannelUserId, StatusBoardFailureCode, StatusBoardResult } from "../channel/types";
 import { getChannelName, getChannelType, getRootChatIdNumber, parseChannelAddress } from "../channel/id";
 import type { AskQuestion, PendingFilePickerOption, PendingOutputModeOption } from "../session/manager";
 import { readManifests } from "../bot/handlers/remote-control";
 import { collectRecentActivityPreviewFromRaw, type DisplayEntry } from "../cli/peek";
 import { chmod, open, readFile, realpath, stat, writeFile } from "fs/promises";
 import { basename, dirname, join, resolve } from "path";
+import { createHash } from "crypto";
 
 const DAEMON_STARTED_AT = Date.now();
 
@@ -336,6 +337,7 @@ export const __daemonTestUtils = {
   renderActiveWaitBoardState,
   renderFinalWaitBoardState,
   renderInterruptedWaitBoardState,
+  markWaitCycleStopRequestedState,
   maintainWaitCycleHeartbeatState,
   refreshWaitCycleBoardsState,
   finalizeWaitCycleBoardsState,
@@ -365,6 +367,8 @@ interface BackgroundJobEvent {
 }
 
 type WaitTrackedItemStatus = NonNullable<WaitStateEvent["items"][number]["status"]>;
+type WaitCycleCompletionReason = "normal" | "stop_requested";
+type WaitBoardRetryFailureCode = Extract<StatusBoardFailureCode, "timeout" | "text_too_long">;
 
 interface WaitTrackedItemState {
   itemKey: string;
@@ -380,6 +384,27 @@ interface WaitChatHeartbeatState {
   stopTimer: ReturnType<typeof setTimeout> | null;
 }
 
+interface WaitBoardRetryState {
+  fingerprint: string;
+  failureCode: WaitBoardRetryFailureCode;
+  htmlLength: number;
+}
+
+interface WaitBoardLogEvent {
+  category: "wait_board_active" | "wait_board_final" | "wait_board_interrupted";
+  operation: "send" | "edit" | "skip" | "timeout" | "error" | "clear";
+  sessionId: string;
+  chatId: ChannelChatId;
+  boardKey: string;
+  waitItemCount: number;
+  htmlLength: number;
+  fingerprint?: string;
+  messageId?: string;
+  failureCode?: StatusBoardFailureCode;
+  compact?: boolean;
+  note?: string;
+}
+
 interface WaitCycleState {
   cycleId: number;
   boardKey: string;
@@ -387,11 +412,12 @@ interface WaitCycleState {
   openWaitGroups: Set<string>;
   items: Map<string, WaitTrackedItemState>;
   heartbeatByChat: Map<ChannelChatId, WaitChatHeartbeatState>;
+  boardRetryByChat: Map<ChannelChatId, WaitBoardRetryState>;
+  completionReason: WaitCycleCompletionReason;
   finalizing: boolean;
   finalSummary?: string;
   lastBoardRefreshAt: number;
 }
-
 
 interface PersistedStatusBoardEntry {
   chatId: string;
@@ -420,6 +446,8 @@ interface SessionManifest {
 const WAIT_HEARTBEAT_PULSE_MS = 5_000;
 const WAIT_HEARTBEAT_INTERVAL_MS = 60_000;
 const WAIT_BOARD_DETAIL_MAX = 280;
+const WAIT_BOARD_MAX_CHARS = 3_500;
+const WAIT_BOARD_MAX_ITEMS = 18;
 const WAIT_TERMINAL_STATUSES = new Set<WaitTrackedItemStatus>(["completed", "failed", "blocked"]);
 
 interface WaitBoardOps {
@@ -439,6 +467,7 @@ interface WaitBoardOps {
   setTyping(chatId: ChannelChatId, active: boolean): void;
   setStopTimer(callback: () => void, delayMs: number): ReturnType<typeof setTimeout>;
   clearStopTimer(timer: ReturnType<typeof setTimeout>): void;
+  logWaitBoardEvent?(event: WaitBoardLogEvent): Promise<void> | void;
 }
 
 function createWaitCycleState(sessionId: string, cycleId: number, now = Date.now()): WaitCycleState {
@@ -449,6 +478,8 @@ function createWaitCycleState(sessionId: string, cycleId: number, now = Date.now
     openWaitGroups: new Set<string>(),
     items: new Map<string, WaitTrackedItemState>(),
     heartbeatByChat: new Map<ChannelChatId, WaitChatHeartbeatState>(),
+    boardRetryByChat: new Map<ChannelChatId, WaitBoardRetryState>(),
+    completionReason: "normal",
     finalizing: false,
     lastBoardRefreshAt: 0,
   };
@@ -485,6 +516,10 @@ function isTerminalWaitStatus(status: WaitTrackedItemStatus): boolean {
   return WAIT_TERMINAL_STATUSES.has(status);
 }
 
+function createDeliveryFingerprint(text: string): string {
+  return createHash("sha1").update(text).digest("hex").slice(0, 12);
+}
+
 function getOrderedWaitItems(cycle: WaitCycleState): WaitTrackedItemState[] {
   const statusOrder: Record<WaitTrackedItemStatus, number> = {
     running: 0,
@@ -515,20 +550,58 @@ function renderWaitItemLines(chatId: ChannelChatId, item: WaitTrackedItemState, 
   return lines;
 }
 
+function renderWaitBoardLines(
+  chatId: ChannelChatId,
+  items: WaitTrackedItemState[],
+  fmt: Formatter,
+  headerLines: string[],
+  emptyLine: string,
+  maxItems = WAIT_BOARD_MAX_ITEMS
+  ): string {
+  if (items.length === 0) return [...headerLines, fmt.escape(emptyLine)].join("\n");
+
+  const blocks: string[][] = [];
+  for (const item of items) {
+    if (blocks.length >= maxItems) break;
+    const candidateBlocks = [...blocks, renderWaitItemLines(chatId, item, fmt)];
+    const remaining = items.length - candidateBlocks.length;
+    const candidateLines = [...headerLines, ...candidateBlocks.flat()];
+    if (remaining > 0) candidateLines.push(fmt.escape(`… +${remaining} more task${remaining === 1 ? "" : "s"}`));
+    if (candidateLines.join("\n").length > WAIT_BOARD_MAX_CHARS) break;
+    blocks.push(renderWaitItemLines(chatId, item, fmt));
+  }
+
+  let hidden = items.length - blocks.length;
+  let visibleBlocks = blocks;
+  while (hidden > 0) {
+    const overflowLine = fmt.escape(`… +${hidden} more task${hidden === 1 ? "" : "s"}`);
+    const candidateLines = [...headerLines, ...visibleBlocks.flat(), overflowLine];
+    if (candidateLines.join("\n").length <= WAIT_BOARD_MAX_CHARS) {
+      return candidateLines.join("\n");
+    }
+    if (visibleBlocks.length === 0) break;
+    visibleBlocks = visibleBlocks.slice(0, -1);
+    hidden += 1;
+  }
+
+  const visibleLines = [...headerLines, ...visibleBlocks.flat()];
+  if (visibleLines.join("\n").length <= WAIT_BOARD_MAX_CHARS && visibleBlocks.length > 0) return visibleLines.join("\n");
+  return [...headerLines, fmt.escape(`… +${items.length} tracked task${items.length === 1 ? "" : "s"}`)].join("\n");
+}
+
 function renderActiveWaitBoardState(chatId: ChannelChatId, cycle: WaitCycleState, fmt: Formatter): string {
   const items = getOrderedWaitItems(cycle);
-  const lines: string[] = [
-    `${fmt.escape("⏳")} ${fmt.bold(fmt.escape(`Waiting on ${items.length} task${items.length === 1 ? "" : "s"}`))}`,
-  ];
-  if (items.length === 0) {
-    lines.push(fmt.escape("Waiting for task updates..."));
-    return lines.join("\n");
-  }
-  for (const item of items) lines.push(...renderWaitItemLines(chatId, item, fmt));
-  return lines.join("\n");
+  return renderWaitBoardLines(
+    chatId,
+    items,
+    fmt,
+    [`${fmt.escape("⏳")} ${fmt.bold(fmt.escape(`Waiting on ${items.length} task${items.length === 1 ? "" : "s"}`))}`],
+    "Waiting for task updates..."
+  );
 }
 
 function getFinalWaitOutcome(cycle: WaitCycleState): { emoji: string; label: string } {
+  if (cycle.completionReason === "stop_requested") return { emoji: "🛑", label: "Stop requested" };
   const items = Array.from(cycle.items.values());
   if (items.some((item) => item.status === "failed")) return { emoji: "❌", label: "Wait finished with failures" };
   if (items.some((item) => item.status === "blocked")) return { emoji: "🛑", label: "Wait blocked" };
@@ -538,15 +611,33 @@ function getFinalWaitOutcome(cycle: WaitCycleState): { emoji: string; label: str
 function renderFinalWaitBoardState(chatId: ChannelChatId, cycle: WaitCycleState, fmt: Formatter): string {
   const items = getOrderedWaitItems(cycle);
   const outcome = getFinalWaitOutcome(cycle);
-  const lines: string[] = [`${fmt.escape(outcome.emoji)} ${fmt.bold(fmt.escape(outcome.label))}`];
   const summary = normalizeWaitDetail(cycle.finalSummary);
-  if (summary) lines.push(fmt.escape(summary));
-  else if (items.length > 0) lines.push(fmt.escape(`${items.length} task${items.length === 1 ? "" : "s"} reached terminal status.`));
-  if (items.length === 0) {
-    lines.push(fmt.escape("No wait items were reported."));
-    return lines.join("\n");
-  }
-  for (const item of items) lines.push(...renderWaitItemLines(chatId, item, fmt));
+  const headerLines = [`${fmt.escape(outcome.emoji)} ${fmt.bold(fmt.escape(outcome.label))}`];
+  if (summary) headerLines.push(fmt.escape(summary));
+  else if (items.length > 0) headerLines.push(fmt.escape(`${items.length} task${items.length === 1 ? "" : "s"} reached terminal status.`));
+  return renderWaitBoardLines(chatId, items, fmt, headerLines, "No wait items were reported.");
+}
+
+function renderCompactStopRequestedWaitBoardState(chatId: ChannelChatId, cycle: WaitCycleState, fmt: Formatter): string {
+  const items = getOrderedWaitItems(cycle);
+  const counts = { queued: 0, running: 0, completed: 0, failed: 0, blocked: 0 } satisfies Record<WaitTrackedItemStatus, number>;
+  for (const item of items) counts[item.status] += 1;
+  const parts = ([
+    counts.running ? `${counts.running} running` : null,
+    counts.queued ? `${counts.queued} queued` : null,
+    counts.failed ? `${counts.failed} failed` : null,
+    counts.blocked ? `${counts.blocked} blocked` : null,
+    counts.completed ? `${counts.completed} completed` : null,
+  ].filter((value): value is string => value !== null));
+  const lines = [
+    `${fmt.escape("🛑")} ${fmt.bold(fmt.escape("Stop requested"))}`,
+    fmt.escape(normalizeWaitDetail(cycle.finalSummary) || "Wait tracking stopped at user request."),
+    fmt.escape(
+      items.length === 0
+        ? "No wait items were reported."
+        : `${items.length} tracked task${items.length === 1 ? "" : "s"}${parts.length > 0 ? ` — ${parts.join(", ")}` : ""}`
+    ),
+  ];
   return lines.join("\n");
 }
 
@@ -635,6 +726,40 @@ function maintainWaitCycleHeartbeatState(sessionId: string, cycle: WaitCycleStat
   }
 }
 
+function markWaitCycleStopRequestedState(cycle: WaitCycleState, now = Date.now()): void {
+  cycle.completionReason = "stop_requested";
+  cycle.openWaitGroups.clear();
+  cycle.finalSummary = normalizeWaitDetail(cycle.finalSummary) || "Wait tracking stopped at user request.";
+  cycle.boardRetryByChat.clear();
+  for (const item of cycle.items.values()) {
+    if (isTerminalWaitStatus(item.status)) continue;
+    item.status = "blocked";
+    item.updatedAt = now;
+  }
+}
+
+async function logWaitBoardEventState(ops: WaitBoardOps, event: WaitBoardLogEvent): Promise<void> {
+  await ops.logWaitBoardEvent?.(event);
+}
+
+function getStatusBoardResultState(value: void | StatusBoardResult): StatusBoardResult | undefined {
+  return value && typeof value === "object" ? value : undefined;
+}
+
+function rememberWaitBoardFailure(
+  cycle: WaitCycleState,
+  chatId: ChannelChatId,
+  fingerprint: string,
+  htmlLength: number,
+  failureCode: WaitBoardRetryFailureCode
+): void {
+  cycle.boardRetryByChat.set(chatId, { fingerprint, htmlLength, failureCode });
+}
+
+function clearWaitBoardFailure(cycle: WaitCycleState, chatId: ChannelChatId): void {
+  cycle.boardRetryByChat.delete(chatId);
+}
+
 async function refreshWaitCycleBoardsState(sessionId: string, cycle: WaitCycleState, ops: WaitBoardOps): Promise<void> {
   const key = cycle.boardKey;
   const targets = ops.getConversationTargets(sessionId);
@@ -654,8 +779,22 @@ async function refreshWaitCycleBoardsState(sessionId: string, cycle: WaitCycleSt
         cleared = true;
       }
     } catch {}
-    if (cleared) ops.removePersistedStatusBoard(chatId, key);
-    else boardOwningChats.add(chatId);
+    if (cleared) {
+      ops.removePersistedStatusBoard(chatId, key);
+      clearWaitBoardFailure(cycle, chatId);
+      await logWaitBoardEventState(ops, {
+        category: "wait_board_active",
+        operation: "clear",
+        sessionId,
+        chatId,
+        boardKey: key,
+        waitItemCount: cycle.items.size,
+        htmlLength: 0,
+        messageId: entry.messageId,
+      });
+    } else {
+      boardOwningChats.add(chatId);
+    }
     stopWaitHeartbeatForChatState(cycle, chatId, ops);
   }
 
@@ -667,22 +806,80 @@ async function refreshWaitCycleBoardsState(sessionId: string, cycle: WaitCycleSt
         await channel?.clearStatusBoard?.(chatId, key, { unpin: true, messageId: persisted?.messageId, pinned: persisted?.pinned });
       } catch {}
       ops.removePersistedStatusBoard(chatId, key);
+      clearWaitBoardFailure(cycle, chatId);
       continue;
     }
-    try {
-      const result = await channel.upsertStatusBoard(chatId, key, renderActiveWaitBoardState(chatId, cycle, ops.getFormatterForChat(chatId)), {
-        pin: true,
-        messageId: persisted?.messageId,
-        pinned: persisted?.pinned,
+
+    const html = renderActiveWaitBoardState(chatId, cycle, ops.getFormatterForChat(chatId));
+    const fingerprint = createDeliveryFingerprint(html);
+    const retryState = !persisted?.messageId ? cycle.boardRetryByChat.get(chatId) : undefined;
+    if (retryState?.fingerprint === fingerprint) {
+      await logWaitBoardEventState(ops, {
+        category: "wait_board_active",
+        operation: retryState.failureCode === "timeout" ? "timeout" : "skip",
+        sessionId,
+        chatId,
+        boardKey: key,
+        waitItemCount: cycle.items.size,
+        htmlLength: retryState.htmlLength,
+        fingerprint,
+        failureCode: retryState.failureCode,
+        note: "Skipping repeated board attempt until content changes.",
       });
-      const boardResult = result && typeof result === "object" ? result : undefined;
-      const messageId = boardResult?.messageId || persisted?.messageId;
-      const pinned = boardResult?.pinned ?? persisted?.pinned ?? false;
-      if (messageId) {
-        ops.setPersistedStatusBoard(chatId, key, messageId, pinned);
-        boardOwningChats.add(chatId);
+      continue;
+    }
+
+    await logWaitBoardEventState(ops, {
+      category: "wait_board_active",
+      operation: persisted?.messageId ? "edit" : "send",
+      sessionId,
+      chatId,
+      boardKey: key,
+      waitItemCount: cycle.items.size,
+      htmlLength: html.length,
+      fingerprint,
+      messageId: persisted?.messageId,
+    });
+
+    const boardResult = getStatusBoardResultState(await channel.upsertStatusBoard(chatId, key, html, {
+      pin: true,
+      messageId: persisted?.messageId,
+      pinned: persisted?.pinned,
+    }));
+    if (boardResult?.action === "failed") {
+      if (persisted?.messageId) boardOwningChats.add(chatId);
+      if (boardResult.failureCode === "timeout" || boardResult.failureCode === "text_too_long") {
+        if (!persisted?.messageId) {
+          rememberWaitBoardFailure(cycle, chatId, fingerprint, html.length, boardResult.failureCode);
+        } else {
+          clearWaitBoardFailure(cycle, chatId);
+        }
+        await logWaitBoardEventState(ops, {
+          category: "wait_board_active",
+          operation: boardResult.failureCode === "timeout" ? "timeout" : "error",
+          sessionId,
+          chatId,
+          boardKey: key,
+          waitItemCount: cycle.items.size,
+          htmlLength: html.length,
+          fingerprint,
+          failureCode: boardResult.failureCode,
+          note: boardResult.error,
+        });
+      } else {
+        clearWaitBoardFailure(cycle, chatId);
       }
-    } catch {}
+      continue;
+    }
+    const messageId = boardResult?.messageId || persisted?.messageId;
+    const pinned = boardResult?.pinned ?? persisted?.pinned ?? false;
+    if (messageId) {
+      ops.setPersistedStatusBoard(chatId, key, messageId, pinned);
+      boardOwningChats.add(chatId);
+      clearWaitBoardFailure(cycle, chatId);
+      continue;
+    }
+    clearWaitBoardFailure(cycle, chatId);
   }
 
   ops.syncPersistedActiveWaitCycle(sessionId, cycle, boardOwningChats);
@@ -714,40 +911,121 @@ async function finalizeWaitCycleBoardsState(sessionId: string, cycle: WaitCycleS
           cleaned = true;
         }
       } catch {}
-      if (cleaned) ops.removePersistedStatusBoard(chatId, key);
-      else unresolvedChats.add(chatId);
+      if (cleaned) {
+        ops.removePersistedStatusBoard(chatId, key);
+        clearWaitBoardFailure(cycle, chatId);
+      } else if (persisted?.messageId) {
+        unresolvedChats.add(chatId);
+      }
       continue;
     }
 
-    if (channel?.upsertStatusBoard && persisted?.messageId) {
-      try {
-        const result = await channel.upsertStatusBoard(chatId, key, renderFinalWaitBoardState(chatId, cycle, ops.getFormatterForChat(chatId)), {
-          pin: false,
-          messageId: persisted.messageId,
-          pinned: persisted.pinned,
+    const formatter = ops.getFormatterForChat(chatId);
+    let html = renderFinalWaitBoardState(chatId, cycle, formatter);
+    let compact = false;
+    let boardResult: StatusBoardResult | undefined;
+    let messageId = persisted?.messageId;
+    let pinned = persisted?.pinned ?? false;
+    if (channel?.upsertStatusBoard) {
+      await logWaitBoardEventState(ops, {
+        category: "wait_board_final",
+        operation: messageId ? "edit" : "send",
+        sessionId,
+        chatId,
+        boardKey: key,
+        waitItemCount: cycle.items.size,
+        htmlLength: html.length,
+        fingerprint: createDeliveryFingerprint(html),
+        messageId,
+      });
+      boardResult = getStatusBoardResultState(await channel.upsertStatusBoard(chatId, key, html, {
+        pin: false,
+        messageId,
+        pinned,
+      }));
+      if (boardResult?.action !== "failed") {
+        messageId = boardResult?.messageId || messageId;
+        pinned = boardResult?.pinned ?? pinned;
+      }
+
+      if (cycle.completionReason === "stop_requested" && boardResult?.failureCode === "text_too_long") {
+        html = renderCompactStopRequestedWaitBoardState(chatId, cycle, formatter);
+        compact = true;
+        await logWaitBoardEventState(ops, {
+          category: "wait_board_final",
+          operation: "send",
+          sessionId,
+          chatId,
+          boardKey: key,
+          waitItemCount: cycle.items.size,
+          htmlLength: html.length,
+          fingerprint: createDeliveryFingerprint(html),
+          compact: true,
+          note: "Retrying final stop board with compact summary.",
         });
-        const boardResult = result && typeof result === "object" ? result : undefined;
-        const messageId = boardResult?.messageId || persisted.messageId;
-        const pinned = boardResult?.pinned ?? persisted.pinned ?? false;
-        if (messageId) ops.setPersistedStatusBoard(chatId, key, messageId, pinned);
-        if (channel.clearStatusBoard) {
-          await channel.clearStatusBoard(chatId, key, { unpin: true, messageId, pinned });
-          cleaned = true;
+        boardResult = getStatusBoardResultState(await channel.upsertStatusBoard(chatId, key, html, {
+          pin: false,
+          messageId,
+          pinned,
+        }));
+        if (boardResult?.action !== "failed") {
+          messageId = boardResult?.messageId || messageId;
+          pinned = boardResult?.pinned ?? pinned;
         }
+      }
+    }
+
+    if (boardResult?.action === "failed") {
+      await logWaitBoardEventState(ops, {
+        category: "wait_board_final",
+        operation: boardResult.failureCode === "timeout" ? "timeout" : "error",
+        sessionId,
+        chatId,
+        boardKey: key,
+        waitItemCount: cycle.items.size,
+        htmlLength: html.length,
+        fingerprint: createDeliveryFingerprint(html),
+        failureCode: boardResult.failureCode,
+        compact,
+        note: boardResult.error,
+      });
+      if (persisted?.messageId) unresolvedChats.add(chatId);
+      continue;
+    }
+
+    if (messageId) {
+      ops.setPersistedStatusBoard(chatId, key, messageId, pinned);
+      clearWaitBoardFailure(cycle, chatId);
+    }
+
+    if (messageId && channel?.clearStatusBoard) {
+      try {
+        await channel.clearStatusBoard(chatId, key, { unpin: true, messageId, pinned });
+        cleaned = true;
+        await logWaitBoardEventState(ops, {
+          category: "wait_board_final",
+          operation: "clear",
+          sessionId,
+          chatId,
+          boardKey: key,
+          waitItemCount: cycle.items.size,
+          htmlLength: html.length,
+          fingerprint: createDeliveryFingerprint(html),
+          messageId,
+          compact,
+        });
       } catch {}
     }
 
-    if (!cleaned) {
+    if (!cleaned && channel?.clearStatusBoard) {
       try {
-        if (channel?.clearStatusBoard) {
-          await channel.clearStatusBoard(chatId, key, { unpin: true, messageId: persisted?.messageId, pinned: persisted?.pinned });
-          cleaned = true;
-        }
+        await channel.clearStatusBoard(chatId, key, { unpin: true, messageId: persisted?.messageId, pinned: persisted?.pinned });
+        cleaned = true;
       } catch {}
     }
 
     if (cleaned) ops.removePersistedStatusBoard(chatId, key);
-    else unresolvedChats.add(chatId);
+    else if (messageId) unresolvedChats.add(chatId);
   }
 
   const retryEntry = activeEntry ?? { sessionId, cycleId: cycle.cycleId, boardKey: key, activeChatIds: [] };
@@ -771,22 +1049,33 @@ async function cleanupInterruptedWaitCycleBoardsState(ops: WaitBoardOps): Promis
       let cleaned = false;
 
       if (channel?.upsertStatusBoard && persisted?.messageId) {
-        try {
-          const result = await channel.upsertStatusBoard(
-            chatId,
-            entry.boardKey,
-            renderInterruptedWaitBoardState(chatId, ops.getFormatterForChat(chatId)),
-            { pin: false, messageId: persisted.messageId, pinned: persisted.pinned }
-          );
-          const boardResult = result && typeof result === "object" ? result : undefined;
-          const messageId = boardResult?.messageId || persisted.messageId;
-          const pinned = boardResult?.pinned ?? persisted.pinned ?? false;
-          if (messageId) ops.setPersistedStatusBoard(chatId, entry.boardKey, messageId, pinned);
-          if (channel.clearStatusBoard) {
+        const html = renderInterruptedWaitBoardState(chatId, ops.getFormatterForChat(chatId));
+        await logWaitBoardEventState(ops, {
+          category: "wait_board_interrupted",
+          operation: "edit",
+          sessionId: entry.sessionId,
+          chatId,
+          boardKey: entry.boardKey,
+          waitItemCount: 0,
+          htmlLength: html.length,
+          fingerprint: createDeliveryFingerprint(html),
+          messageId: persisted.messageId,
+        });
+        const boardResult = getStatusBoardResultState(await channel.upsertStatusBoard(
+          chatId,
+          entry.boardKey,
+          html,
+          { pin: false, messageId: persisted.messageId, pinned: persisted.pinned }
+        ));
+        const messageId = boardResult?.messageId || persisted.messageId;
+        const pinned = boardResult?.pinned ?? persisted.pinned ?? false;
+        if (messageId) ops.setPersistedStatusBoard(chatId, entry.boardKey, messageId, pinned);
+        if (messageId && channel.clearStatusBoard) {
+          try {
             await channel.clearStatusBoard(chatId, entry.boardKey, { unpin: true, messageId, pinned });
             cleaned = true;
-          }
-        } catch {}
+          } catch {}
+        }
       }
 
       if (!cleaned) {
@@ -799,7 +1088,7 @@ async function cleanupInterruptedWaitCycleBoardsState(ops: WaitBoardOps): Promis
       }
 
       if (cleaned) ops.removePersistedStatusBoard(chatId, entry.boardKey);
-      else unresolvedChats.add(chatId);
+      else if (persisted?.messageId) unresolvedChats.add(chatId);
     }
 
     ops.syncPersistedWaitCycleRetryState(entry, unresolvedChats);
@@ -985,12 +1274,42 @@ export async function startDaemon(): Promise<void> {
     if (!channel?.sendPoll) return null;
     return channel.sendPoll(chatId, question, options, multiSelect, sendOptions);
   };
+  const logTelegramDelivery = async (payload: {
+    category: string;
+    operation: string;
+    chatId?: ChannelChatId;
+    sessionId?: string;
+    boardKey?: string;
+    waitItemCount?: number;
+    timeoutMs?: number;
+    html?: string;
+    htmlLength?: number;
+    fingerprint?: string;
+    messageId?: string;
+    failureCode?: StatusBoardFailureCode;
+    note?: string;
+    compact?: boolean;
+  }): Promise<void> => {
+    const { html, ...rest } = payload;
+    await debugLogIfEnabled("Telegram delivery", {
+      ...rest,
+      htmlLength: payload.htmlLength ?? html?.length ?? 0,
+      fingerprint: payload.fingerprint ?? (html ? createDeliveryFingerprint(html) : undefined),
+    });
+  };
+
   const enqueueOrderedConversationDelivery = createOrderedConversationQueue({
     getTimeoutMs: () => Math.max(250, config.settings.orderedConversationTimeoutMs),
     logSkip: async (chatId, error) => {
-      await logger.warn("Skipping stalled ordered conversation event", {
+      await debugLogIfEnabled("Skipping stalled ordered conversation event", {
         chatId,
         error: error.message,
+      });
+      await logTelegramDelivery({
+        category: "ordered_transcript",
+        operation: error.message.toLowerCase().includes("timed out") ? "timeout" : "skip",
+        chatId,
+        note: error.message,
       });
     },
     onSkip: async (chatId, timeoutMs) => {
@@ -998,11 +1317,46 @@ export async function startDaemon(): Promise<void> {
       const channel = getChannelForChat(chatId);
       if (!output.orderingNotices || !channel) return;
       const fmt = getFormatterForChat(chatId);
+      const notice = `${fmt.escape("⛳️")} ${fmt.escape("Skipped one bridge event to preserve message order.")}`;
+      await logTelegramDelivery({ category: "ordered_transcript", operation: "send", chatId, timeoutMs, html: notice, note: "ordering notice" });
       await channel
-        .send(chatId, `${fmt.escape("⛳️")} ${fmt.escape("Skipped one bridge event to preserve message order.")}`, { timeoutMs })
+        .send(chatId, notice, { timeoutMs })
         .catch(() => {});
     },
   });
+
+  const sendOrderedConversationHtml = async (
+    sessionId: string,
+    chatId: ChannelChatId,
+    channel: Channel,
+    html: string,
+    timeoutMs: number,
+    note?: string
+  ): Promise<void> => {
+    await logTelegramDelivery({ category: "ordered_transcript", operation: "send", sessionId, chatId, timeoutMs, html, note });
+    await channel.send(chatId, html, { timeoutMs });
+  };
+
+  const sendOrderedConversationDocument = async (
+    sessionId: string,
+    chatId: ChannelChatId,
+    channel: Channel,
+    filePath: string,
+    caption: string | undefined,
+    timeoutMs: number
+  ): Promise<void> => {
+    await logTelegramDelivery({
+      category: "ordered_transcript",
+      operation: "send",
+      sessionId,
+      chatId,
+      timeoutMs,
+      htmlLength: caption?.length ?? 0,
+      fingerprint: caption ? createDeliveryFingerprint(caption) : undefined,
+      note: filePath,
+    });
+    await channel.sendDocument?.(chatId, filePath, caption, { timeoutMs });
+  };
   const getConversationTargets = (sessionId: string, includeGroups = true): Set<ChannelChatId> => {
     const targets = new Set<ChannelChatId>();
     const targetChat = sessionManager.getBoundChat(sessionId);
@@ -1558,8 +1912,8 @@ export async function startDaemon(): Promise<void> {
 
 
   const getStatusBoardResult = (
-    value: void | { messageId?: string; pinned?: boolean }
-  ): { messageId?: string; pinned?: boolean } | undefined => {
+    value: void | StatusBoardResult
+  ): StatusBoardResult | undefined => {
     return value && typeof value === "object" ? value : undefined;
   };
 
@@ -2312,16 +2666,7 @@ export async function startDaemon(): Promise<void> {
 
   const createWaitCycle = (sessionId: string): WaitCycleState => {
     const cycleId = nextWaitCycleId(sessionId);
-    return {
-      cycleId,
-      boardKey: waitCycleBoardKey(sessionId, cycleId),
-      createdAt: Date.now(),
-      openWaitGroups: new Set<string>(),
-      items: new Map<string, WaitTrackedItemState>(),
-      heartbeatByChat: new Map<ChannelChatId, WaitChatHeartbeatState>(),
-      finalizing: false,
-      lastBoardRefreshAt: 0,
-    };
+    return createWaitCycleState(sessionId, cycleId, Date.now());
   };
 
   const normalizeWaitText = (value?: string | null): string | undefined => {
@@ -2456,38 +2801,43 @@ export async function startDaemon(): Promise<void> {
     }
   };
 
+  const logWaitBoardEvent = async (event: WaitBoardLogEvent): Promise<void> => {
+    await logTelegramDelivery(event);
+  };
+
+  const waitBoardOps: WaitBoardOps = {
+    getConversationTargets: (sessionId) => getConversationTargets(sessionId),
+    getOutputPreferencesForChat: (chatId) => getOutputPreferencesForChat(chatId),
+    getChannelForChat: (chatId) => getChannelForChat(chatId) || undefined,
+    getFormatterForChat: (chatId) => getFormatterForChat(chatId),
+    getPersistedStatusBoard: (chatId, boardKey) => persistedStatusBoards.get(statusBoardMapKey(chatId, boardKey)),
+    listPersistedStatusBoardsForBoard: (boardKey) => Array.from(persistedStatusBoards.values()).filter((entry) => entry.boardKey === boardKey),
+    setPersistedStatusBoard: (chatId, boardKey, messageId, pinned) => setPersistedStatusBoard(chatId, boardKey, messageId, pinned),
+    removePersistedStatusBoard: (chatId, boardKey) => removePersistedStatusBoard(chatId, boardKey),
+    getPersistedActiveWaitCycle: (boardKey) => persistedActiveWaitCycles.get(boardKey),
+    syncPersistedActiveWaitCycle: (sessionId, cycle, activeChatIds) => syncPersistedActiveWaitCycle(sessionId, cycle, activeChatIds),
+    syncPersistedWaitCycleRetryState: (entry, activeChatIds) => syncPersistedWaitCycleRetryState(entry, activeChatIds),
+    removePersistedActiveWaitCycle: (boardKey) => {
+      persistedActiveWaitCycles.delete(boardKey);
+      schedulePersistStatusBoards();
+    },
+    listPersistedWaitCyclesForCleanup: () => listPersistedWaitCyclesForCleanup(),
+    setTyping: (chatId, active) => setTypingForChat(chatId, active),
+    setStopTimer: (callback, delayMs) => setTimeout(callback, delayMs),
+    clearStopTimer: (timer) => clearTimeout(timer),
+    logWaitBoardEvent,
+  };
+
   const maintainWaitCycleHeartbeat = (sessionId: string, cycle: WaitCycleState, now = Date.now()): void => {
-    const eligibleChats = new Set<ChannelChatId>();
-    for (const chatId of getConversationTargets(sessionId)) {
-      if (!getOutputPreferencesForChat(chatId).typingIndicator) continue;
-      eligibleChats.add(chatId);
-    }
+    maintainWaitCycleHeartbeatState(sessionId, cycle, waitBoardOps, now);
+  };
 
-    for (const chatId of Array.from(cycle.heartbeatByChat.keys())) {
-      if (!eligibleChats.has(chatId)) stopWaitHeartbeatForChat(cycle, chatId);
-    }
+  const refreshWaitCycleBoards = (sessionId: string, cycle: WaitCycleState): Promise<void> => {
+    return refreshWaitCycleBoardsState(sessionId, cycle, waitBoardOps);
+  };
 
-    for (const chatId of eligibleChats) {
-      const current = cycle.heartbeatByChat.get(chatId) || { lastPulseAt: 0, stopTimer: null };
-      if (current.lastPulseAt !== 0 && now - current.lastPulseAt < WAIT_HEARTBEAT_INTERVAL_MS) {
-        cycle.heartbeatByChat.set(chatId, current);
-        continue;
-      }
-      if (current.stopTimer) clearTimeout(current.stopTimer);
-      setTypingForChat(chatId, true);
-      current.lastPulseAt = now;
-      current.stopTimer = setTimeout(() => {
-        const activeCycle = activeWaitCyclesBySession.get(sessionId);
-        if (activeCycle !== cycle) {
-          setTypingForChat(chatId, false);
-          return;
-        }
-        const activeHeartbeat = cycle.heartbeatByChat.get(chatId);
-        if (activeHeartbeat) activeHeartbeat.stopTimer = null;
-        setTypingForChat(chatId, false);
-      }, WAIT_HEARTBEAT_PULSE_MS);
-      cycle.heartbeatByChat.set(chatId, current);
-    }
+  const finalizeWaitCycleBoards = (sessionId: string, cycle: WaitCycleState): Promise<void> => {
+    return finalizeWaitCycleBoardsState(sessionId, cycle, waitBoardOps);
   };
 
   const enqueueWaitCycleBoardWork = (sessionId: string, work: () => Promise<void>): void => {
@@ -2509,172 +2859,6 @@ export async function startDaemon(): Promise<void> {
     waitCycleBoardWorkBySession.set(sessionId, tracked);
   };
 
-  const refreshWaitCycleBoards = async (sessionId: string, cycle: WaitCycleState): Promise<void> => {
-    const key = cycle.boardKey;
-    const targets = getConversationTargets(sessionId);
-    const entriesForCycle = Array.from(persistedStatusBoards.values()).filter((entry) => entry.boardKey === key);
-    const boardOwningChats = new Set<ChannelChatId>(
-      entriesForCycle
-        .filter((entry) => targets.has(entry.chatId))
-        .map((entry) => entry.chatId)
-    );
-    for (const entry of entriesForCycle) {
-      if (targets.has(entry.chatId)) continue;
-      const channel = getChannelForChat(entry.chatId);
-      let cleared = false;
-      try {
-        if (channel?.clearStatusBoard) {
-          await channel.clearStatusBoard(entry.chatId, key, {
-            unpin: true,
-            messageId: entry.messageId,
-            pinned: entry.pinned,
-          });
-          cleared = true;
-        }
-      } catch {}
-      if (cleared) removePersistedStatusBoard(entry.chatId, key);
-      stopWaitHeartbeatForChat(cycle, entry.chatId);
-    }
-
-    for (const chatId of targets) {
-      const channel = getChannelForChat(chatId);
-      const persisted = persistedStatusBoards.get(statusBoardMapKey(chatId, key));
-      if (!channel?.upsertStatusBoard) {
-        try {
-          await channel?.clearStatusBoard?.(chatId, key, {
-            unpin: true,
-            messageId: persisted?.messageId,
-            pinned: persisted?.pinned,
-          });
-        } catch {}
-        removePersistedStatusBoard(chatId, key);
-        continue;
-      }
-      try {
-        const result = await channel.upsertStatusBoard(chatId, key, renderActiveWaitBoard(chatId, cycle), {
-          pin: true,
-          messageId: persisted?.messageId,
-          pinned: persisted?.pinned,
-        });
-        const boardResult = getStatusBoardResult(result);
-        const messageId = boardResult?.messageId || persisted?.messageId;
-        const pinned = boardResult?.pinned ?? persisted?.pinned ?? false;
-        if (messageId) {
-          setPersistedStatusBoard(chatId, key, messageId, pinned);
-          boardOwningChats.add(chatId);
-        }
-      } catch {}
-    }
-
-    syncPersistedActiveWaitCycle(sessionId, cycle, boardOwningChats);
-  };
-
-  const finalizeWaitCycleBoards = async (sessionId: string, cycle: WaitCycleState): Promise<void> => {
-    cycle.finalizing = true;
-    stopWaitCycleHeartbeats(cycle);
-    const key = cycle.boardKey;
-    const entriesForCycle = Array.from(persistedStatusBoards.values()).filter((entry) => entry.boardKey === key);
-    const activeEntry = persistedActiveWaitCycles.get(key);
-    const chats = new Set<ChannelChatId>([
-      ...entriesForCycle.map((entry) => entry.chatId),
-      ...(activeEntry?.activeChatIds || []),
-      ...getConversationTargets(sessionId),
-    ]);
-    const currentTargets = getConversationTargets(sessionId);
-    const unresolvedChats = new Set<ChannelChatId>();
-
-    for (const chatId of chats) {
-      const channel = getChannelForChat(chatId);
-      const persisted = persistedStatusBoards.get(statusBoardMapKey(chatId, key));
-      let cleaned = false;
-
-      if (!currentTargets.has(chatId)) {
-        try {
-          if (channel?.clearStatusBoard) {
-            await channel.clearStatusBoard(chatId, key, {
-              unpin: true,
-              messageId: persisted?.messageId,
-              pinned: persisted?.pinned,
-            });
-            cleaned = true;
-          }
-        } catch {}
-        if (cleaned) removePersistedStatusBoard(chatId, key);
-        else unresolvedChats.add(chatId);
-        continue;
-      }
-
-      if (channel?.upsertStatusBoard && persisted?.messageId) {
-        try {
-          const result = await channel.upsertStatusBoard(chatId, key, renderFinalWaitBoard(chatId, cycle), {
-            pin: false,
-            messageId: persisted.messageId,
-            pinned: persisted.pinned,
-          });
-          const boardResult = getStatusBoardResult(result);
-          const messageId = boardResult?.messageId || persisted.messageId;
-          const pinned = boardResult?.pinned ?? persisted.pinned ?? false;
-          if (messageId) setPersistedStatusBoard(chatId, key, messageId, pinned);
-          if (channel.clearStatusBoard) {
-            await channel.clearStatusBoard(chatId, key, {
-              unpin: true,
-              messageId,
-              pinned,
-            });
-            cleaned = true;
-          }
-        } catch {}
-      }
-
-      if (!cleaned) {
-        try {
-          if (channel?.clearStatusBoard) {
-            await channel.clearStatusBoard(chatId, key, {
-              unpin: true,
-              messageId: persisted?.messageId,
-              pinned: persisted?.pinned,
-            });
-            cleaned = true;
-          }
-        } catch {}
-      }
-
-      if (cleaned) removePersistedStatusBoard(chatId, key);
-      else unresolvedChats.add(chatId);
-    }
-
-    const retryEntry = activeEntry ?? { sessionId, cycleId: cycle.cycleId, boardKey: key, activeChatIds: [] };
-    syncPersistedWaitCycleRetryState(retryEntry, unresolvedChats);
-    cycle.finalizing = false;
-  };
-
-  const waitCycleCanFinalize = (cycle: WaitCycleState): boolean => {
-    if (cycle.openWaitGroups.size > 0) return false;
-    return Array.from(cycle.items.values()).every((item) => isTerminalWaitStatus(item.status));
-  };
-
-  const applyWaitStateEventToCycle = (cycle: WaitCycleState, event: WaitStateEvent): void => {
-    const now = Date.now();
-    if (event.phase === "startOrUpdate") cycle.openWaitGroups.add(event.waitGroupKey);
-    else cycle.openWaitGroups.delete(event.waitGroupKey);
-
-    for (const patch of event.items) {
-      const existing = cycle.items.get(patch.itemKey);
-      const nextStatus = patch.status || existing?.status || (event.phase === "finish" ? "completed" : "running");
-      cycle.items.set(patch.itemKey, {
-        itemKey: patch.itemKey,
-        title: patch.title !== undefined ? normalizeWaitText(patch.title) : existing?.title,
-        agentId: patch.agentId !== undefined ? normalizeWaitText(patch.agentId) : existing?.agentId,
-        status: nextStatus,
-        detail: patch.detail !== undefined ? normalizeWaitDetail(patch.detail) : existing?.detail,
-        updatedAt: now,
-      });
-    }
-
-    const summary = normalizeWaitText(event.summary);
-    if (summary) cycle.finalSummary = summary;
-    else if (event.phase === "startOrUpdate") cycle.finalSummary = undefined;
-  };
 
   const ensureActiveWaitCycle = (sessionId: string): WaitCycleState => {
     const existing = activeWaitCyclesBySession.get(sessionId);
@@ -2682,6 +2866,18 @@ export async function startDaemon(): Promise<void> {
     const created = createWaitCycle(sessionId);
     activeWaitCyclesBySession.set(sessionId, created);
     return created;
+  };
+
+  const stopActiveWaitCycle = (sessionId: string): void => {
+    const cycle = activeWaitCyclesBySession.get(sessionId);
+    if (!cycle || cycle.finalizing) return;
+    activeWaitCyclesBySession.delete(sessionId);
+    stopWaitCycleHeartbeats(cycle);
+    markWaitCycleStopRequestedState(cycle, Date.now());
+    cycle.lastBoardRefreshAt = Date.now();
+    enqueueWaitCycleBoardWork(sessionId, async () => {
+      await finalizeWaitCycleBoards(sessionId, cycle);
+    });
   };
 
 
@@ -2823,68 +3019,8 @@ export async function startDaemon(): Promise<void> {
     }
   };
 
-  const cleanupInterruptedWaitCycleBoards = async (): Promise<void> => {
-    for (const entry of listPersistedWaitCyclesForCleanup()) {
-      const persistedEntriesForCycle = Array.from(persistedStatusBoards.values()).filter(
-        (persistedEntry) => persistedEntry.boardKey === entry.boardKey
-      );
-      const chats = new Set<ChannelChatId>([
-        ...entry.activeChatIds,
-        ...persistedEntriesForCycle.map((persistedEntry) => persistedEntry.chatId),
-      ]);
-      const unresolvedChats = new Set<ChannelChatId>();
-
-      for (const chatId of chats) {
-        const channel = getChannelForChat(chatId);
-        const persisted = persistedStatusBoards.get(statusBoardMapKey(chatId, entry.boardKey));
-        let cleaned = false;
-
-        if (channel?.upsertStatusBoard && persisted?.messageId) {
-          try {
-            const result = await channel.upsertStatusBoard(
-              chatId,
-              entry.boardKey,
-              renderInterruptedWaitBoard(chatId),
-              {
-                pin: false,
-                messageId: persisted.messageId,
-                pinned: persisted.pinned,
-              }
-            );
-            const boardResult = getStatusBoardResult(result);
-            const messageId = boardResult?.messageId || persisted.messageId;
-            const pinned = boardResult?.pinned ?? persisted.pinned ?? false;
-            if (messageId) setPersistedStatusBoard(chatId, entry.boardKey, messageId, pinned);
-            if (channel.clearStatusBoard) {
-              await channel.clearStatusBoard(chatId, entry.boardKey, {
-                unpin: true,
-                messageId,
-                pinned,
-              });
-              cleaned = true;
-            }
-          } catch {}
-        }
-
-        if (!cleaned) {
-          try {
-            if (channel?.clearStatusBoard) {
-              await channel.clearStatusBoard(chatId, entry.boardKey, {
-                unpin: true,
-                messageId: persisted?.messageId,
-                pinned: persisted?.pinned,
-              });
-              cleaned = true;
-            }
-          } catch {}
-        }
-
-        if (cleaned) removePersistedStatusBoard(chatId, entry.boardKey);
-        else unresolvedChats.add(chatId);
-      }
-
-      syncPersistedWaitCycleRetryState(entry, unresolvedChats);
-    }
+  const cleanupInterruptedWaitCycleBoards = (): Promise<void> => {
+    return cleanupInterruptedWaitCycleBoardsState(waitBoardOps);
   };
 
   await loadPersistedStatusBoards();
@@ -3812,7 +3948,9 @@ export async function startDaemon(): Promise<void> {
           reconnectNoticeBySession.set(remote.id, now);
           const label = sessionLabel(command, cwd, name);
           const fmt = getFormatterForChat(chatId);
-          sendToChat(chatId, `${fmt.escape("⛳️")} ${fmt.bold(fmt.escape(label))} reconnected after daemon restart. Messages sent during restart may have been lost.`);
+          const notice = `${fmt.escape("⛳️")} ${fmt.bold(fmt.escape(label))} reconnected after daemon restart. Messages sent during restart may have been lost.`;
+          void logTelegramDelivery({ category: "reconnect_notice", operation: "send", sessionId: remote.id, chatId, html: notice });
+          sendToChat(chatId, notice);
         }
       }
 
@@ -4040,6 +4178,7 @@ export async function startDaemon(): Promise<void> {
     },
     stopSessionById(sessionId: string): { ok: boolean; error?: string } {
       if (sessionManager.requestRemoteStop(sessionId)) {
+        stopActiveWaitCycle(sessionId);
         return { ok: true };
       }
       return { ok: false, error: "Session not found or already exited" };
@@ -4201,14 +4340,14 @@ export async function startDaemon(): Promise<void> {
 
           if (event.kind === "assistant") {
             setTypingForChat(cid, false);
-            await channel.send(cid, fmt.fromMarkdown(event.text), { timeoutMs });
+            await sendOrderedConversationHtml(sessionId, cid, channel, fmt.fromMarkdown(event.text), timeoutMs, "assistant");
             return;
           }
 
           if (event.kind === "thinking") {
             const message = formatThinkingNotification(fmt, output.thinkingMode, event.text);
             if (!message) return;
-            await channel.send(cid, message, { timeoutMs });
+            await sendOrderedConversationHtml(sessionId, cid, channel, message, timeoutMs, "thinking");
             return;
           }
 
@@ -4217,7 +4356,7 @@ export async function startDaemon(): Promise<void> {
             const detailMode = output.toolCallMode === "detailed" ? "verbose" : "simple";
             const html = formatToolCall(fmt, event.name, event.input, detailMode, remote.cwd);
             if (!html) return;
-            await channel.send(cid, html, { timeoutMs });
+            await sendOrderedConversationHtml(sessionId, cid, channel, html, timeoutMs, `tool_call:${event.name}`);
             setTypingForChat(cid, true);
             return;
           }
@@ -4225,7 +4364,7 @@ export async function startDaemon(): Promise<void> {
           if (event.kind === "toolResult") {
             const message = formatToolResultNotification(fmt, output, event.toolName, event.content, event.isError === true);
             if (!message) return;
-            await channel.send(cid, message, { timeoutMs });
+            await sendOrderedConversationHtml(sessionId, cid, channel, message, timeoutMs, `tool_result:${event.toolName}`);
             if (event.isError !== true) setTypingForChat(cid, true);
             return;
           }
@@ -4235,7 +4374,7 @@ export async function startDaemon(): Promise<void> {
             if (!channel.sendDocument) throw new Error(`Channel ${cid.split(":")[0]} does not support file sending`);
             setTypingForChat(cid, false);
             const caption = (event.caption && event.caption.trim()) || resolvedArtifact.defaultCaption;
-            await channel.sendDocument(cid, resolvedArtifact.filePath, caption, { timeoutMs });
+            await sendOrderedConversationDocument(sessionId, cid, channel, resolvedArtifact.filePath, caption, timeoutMs);
           }
         });
       }

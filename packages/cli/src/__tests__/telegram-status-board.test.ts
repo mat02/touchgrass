@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { TelegramApiError } from "../channels/telegram/api";
 import { TelegramChannel } from "../channels/telegram/channel";
 
 describe("TelegramChannel status board", () => {
@@ -175,5 +176,26 @@ describe("TelegramChannel status board", () => {
     expect(sent.join("")).toBe(`${"A".repeat(4090)}${"B".repeat(100)}`);
     expect(sent.join("")).not.toContain("<b>");
     expect(sent.join("")).not.toContain("<i>");
+  });
+});
+
+describe("TelegramChannel status board failures", () => {
+  it("returns timeout metadata when a fresh board send times out", async () => {
+    const channel = new TelegramChannel("bot-token");
+    const anyChannel = channel as unknown as {
+      api: {
+        sendMessage: (chatId: number, text: string, parseMode: "HTML" | "MarkdownV2" | "", threadId?: number) => Promise<{ message_id: number }>;
+      };
+    };
+
+    anyChannel.api = {
+      sendMessage: async () => {
+        throw new TelegramApiError("timeout", "sendMessage", "Telegram API sendMessage timed out after 15000ms", { timeoutMs: 15000 });
+      },
+    };
+
+    const result = await channel.upsertStatusBoard?.("telegram:123", "wait-cycle:r-1:1", "<b>waiting</b>", { pin: true });
+
+    expect(result).toMatchObject({ action: "failed", failureCode: "timeout" });
   });
 });

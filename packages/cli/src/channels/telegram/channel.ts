@@ -1,5 +1,7 @@
 import {
   TelegramApi,
+  isTelegramApiError,
+  isTelegramTextTooLongError,
   type TelegramUpdate,
   type TelegramMessage,
   type TelegramInlineKeyboardButton,
@@ -14,6 +16,7 @@ import type {
   InboundMessage,
   PollResult,
   PollAnswerHandler,
+  StatusBoardFailureCode,
   StatusBoardResult,
   StatusBoardOptions,
 } from "../../channel/types";
@@ -376,7 +379,7 @@ export class TelegramChannel implements Channel {
       this.lastMessage.delete(chatId);
     } catch (e) {
       const err = e as Error;
-      if (/message is too long/i.test(err.message)) {
+      if (isTelegramTextTooLongError(err)) {
         await logger.warn("Retrying long Telegram message as plain-text chunks", { chatId });
         try {
           for (const chunk of chunkHtmlForTelegramFallback(html)) {
@@ -544,6 +547,20 @@ export class TelegramChannel implements Channel {
     return text.includes("message is not modified");
   }
 
+  private classifyStatusBoardFailure(error: unknown): {
+    error: Error;
+    failureCode: StatusBoardFailureCode;
+  } {
+    const normalized = error instanceof Error ? error : new Error(String(error));
+    if (isTelegramApiError(error) && error.kind === "timeout") {
+      return { error: normalized, failureCode: "timeout" };
+    }
+    if (isTelegramTextTooLongError(error)) {
+      return { error: normalized, failureCode: "text_too_long" };
+    }
+    return { error: normalized, failureCode: "telegram_error" };
+  }
+
   async upsertStatusBoard(
     chatId: ChannelChatId,
     boardKey: string,
@@ -562,11 +579,12 @@ export class TelegramChannel implements Channel {
     let pinned = existing?.pinned ?? options?.pinned ?? false;
     let lastHtml = existing?.html;
     let pinError: string | undefined;
+    let action: StatusBoardResult["action"] = existing?.messageId ? "edited" : "sent";
 
     if (messageId) {
       if (lastHtml === html) {
         this.statusBoards.set(key, { messageId, pinned, html });
-        return { messageId: String(messageId), pinned };
+        return { messageId: String(messageId), pinned, action: "unchanged" };
       }
       try {
         await this.api.editMessageText(numChatId, messageId, html, "HTML", threadId);
@@ -575,9 +593,19 @@ export class TelegramChannel implements Channel {
         if (this.isMessageNotModifiedError(e)) {
           lastHtml = html;
           this.statusBoards.set(key, { messageId, pinned, html: lastHtml });
-          return { messageId: String(messageId), pinned };
+          return { messageId: String(messageId), pinned, action: "unchanged" };
         }
-        // Older Telegram messages can become non-editable; send a fresh status board.
+        const editFailure = this.classifyStatusBoardFailure(e);
+        if (editFailure.failureCode === "timeout" || editFailure.failureCode === "text_too_long") {
+          await logger.error("Failed to edit status board", {
+            chatId,
+            boardKey,
+            error: editFailure.error.message,
+            failureCode: editFailure.failureCode,
+          });
+          if (this.isDeadChatError(editFailure.error.message)) this.onDeadChat?.(chatId, editFailure.error);
+          return { action: "failed", failureCode: editFailure.failureCode, error: editFailure.error.message };
+        }
         try {
           const sent = await this.api.sendMessage(numChatId, html, "HTML", threadId);
           if (existing?.pinned) {
@@ -586,11 +614,21 @@ export class TelegramChannel implements Channel {
           }
           messageId = sent.message_id;
           lastHtml = html;
-        } catch (e) {
-          const err = e as Error;
-          await logger.error("Failed to upsert status board", { chatId, boardKey, error: err.message });
-          if (this.isDeadChatError(err.message)) this.onDeadChat?.(chatId, err);
-          return;
+          action = "sent";
+        } catch (sendError) {
+          const failure = this.classifyStatusBoardFailure(sendError);
+          await logger.error("Failed to upsert status board", {
+            chatId,
+            boardKey,
+            error: failure.error.message,
+            failureCode: failure.failureCode,
+          });
+          if (this.isDeadChatError(failure.error.message)) this.onDeadChat?.(chatId, failure.error);
+          return {
+            action: "failed",
+            failureCode: failure.failureCode,
+            error: failure.error.message,
+          };
         }
       }
     } else {
@@ -599,10 +637,15 @@ export class TelegramChannel implements Channel {
         messageId = sent.message_id;
         lastHtml = html;
       } catch (e) {
-        const err = e as Error;
-        await logger.error("Failed to send status board", { chatId, boardKey, error: err.message });
-        if (this.isDeadChatError(err.message)) this.onDeadChat?.(chatId, err);
-        return;
+        const failure = this.classifyStatusBoardFailure(e);
+        await logger.error("Failed to send status board", {
+          chatId,
+          boardKey,
+          error: failure.error.message,
+          failureCode: failure.failureCode,
+        });
+        if (this.isDeadChatError(failure.error.message)) this.onDeadChat?.(chatId, failure.error);
+        return { action: "failed", failureCode: failure.failureCode, error: failure.error.message };
       }
     }
 
@@ -611,14 +654,13 @@ export class TelegramChannel implements Channel {
         await this.api.pinChatMessage(numChatId, messageId, true);
         pinned = true;
       } catch (e) {
-        // Pin is optional; keep board updates working even without pin permission.
         pinError = (e as Error).message || "Failed to pin status board";
       }
     }
 
     if (messageId) {
       this.statusBoards.set(key, { messageId, pinned, html: lastHtml });
-      return { messageId: String(messageId), pinned, pinError };
+      return { messageId: String(messageId), pinned, pinError, action };
     }
   }
 
@@ -644,7 +686,7 @@ export class TelegramChannel implements Channel {
         // Ignore unpin failures (message may already be unpinned/deleted).
       }
     }
-    return { messageId: String(existing.messageId), pinned: false };
+    return { messageId: String(existing.messageId), pinned: false, action: "cleared" };
   }
 
   // Strip @BotUsername from text (Telegram adds this in groups)
